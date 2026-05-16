@@ -15,6 +15,7 @@
 */
 
 #include "ddraw.h"
+#include "DarkenedSkyeBridge.h"
 #include "d3d9\d3d9External.h"
 #include "Utils\Utils.h"
 #include <cmath>
@@ -3624,6 +3625,7 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 		DWORD FVF = pVertexBufferX->GetFVF9();
 
 		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, FVF, FVF, dwNumVertices, 0, dwFlags, DirectXVersion, _ReturnAddress());
+		DarkenedSkyeBridge::OnDd7to9DrawPrimitiveVB(dptPrimitiveType, FVF, dwStartVertex, dwNumVertices, _ReturnAddress());
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(FVF)))
@@ -3733,6 +3735,7 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveVB(D3DPRIMITIVETYPE dptPrimitive
 		DWORD FVF = pVertexBufferX->GetFVF9();
 
 		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, FVF, FVF, dwNumVertices, dwIndexCount, dwFlags, DirectXVersion, _ReturnAddress());
+		DarkenedSkyeBridge::OnDd7to9DrawIndexedPrimitiveVB(dptPrimitiveType, FVF, dwStartVertex, dwNumVertices, dwIndexCount, _ReturnAddress());
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(FVF)))

@@ -133,6 +133,9 @@
     <ClCompile Include="ddraw\ddraw.cpp">
       <Filter>ddraw</Filter>
     </ClCompile>
+    <ClCompile Include="ddraw\DarkenedSkyeBridge.cpp">
+      <Filter>ddraw</Filter>
+    </ClCompile>
     <ClCompile Include="ddraw\IDirect3DExecuteBuffer.cpp">
       <Filter>ddraw</Filter>
     </ClCompile>
@@ -912,6 +915,9 @@
       <Filter>Settings</Filter>
     </ClInclude>
     <ClInclude Include="ddraw\ddraw.h">
+      <Filter>ddraw</Filter>
+    </ClInclude>
+    <ClInclude Include="ddraw\DarkenedSkyeBridge.h">
       <Filter>ddraw</Filter>
     </ClInclude>
     <ClInclude Include="ddraw\IDirect3DExecuteBuffer.h">

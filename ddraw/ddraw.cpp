@@ -18,6 +18,7 @@
 */
 
 #include "ddraw.h"
+#include "DarkenedSkyeBridge.h"
 #include "deque"
 #include "Dllmain\Dllmain.h"
 #include "d3d9\d3d9External.h"
@@ -752,6 +753,8 @@ void InitDDraw()
 			InitializeCriticalSection(&pecs);
 		}
 		IsInitialized = true;
+
+		DarkenedSkyeBridge::MaybeInstall();
 	}
 
 	// Hook other gdi32 and user32 APIs
