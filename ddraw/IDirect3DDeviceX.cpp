@@ -196,6 +196,54 @@ namespace
 
 		return stream.str();
 	}
+
+	bool TryApplyDarkenedSkyeCameraView(IDirect3DDevice9* Device, DWORD FVF, D3DMATRIX& OldView)
+	{
+		if (!Config.DdrawDarkenedSkyeBridge ||
+			!Device ||
+			((FVF & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW))
+		{
+			return false;
+		}
+
+		DarkenedSkyeBridge::CameraState state = {};
+		if (!DarkenedSkyeBridge::GetLatestCameraState(&state))
+		{
+			return false;
+		}
+
+		D3DMATRIX View = {};
+		float* dst = &View.m[0][0];
+		for (UINT i = 0; i < 16; ++i)
+		{
+			dst[i] = state.view[i];
+		}
+
+		if (FAILED(Device->GetTransform(D3DTS_VIEW, &OldView)))
+		{
+			return false;
+		}
+		if (FAILED(Device->SetTransform(D3DTS_VIEW, &View)))
+		{
+			return false;
+		}
+
+		LOG_LIMIT(160, "[DarkenedSkye-Dd7to9Diag] camera-stamp"
+			" serial=" << state.serial <<
+			" site=" << Logging::hex(state.site) <<
+			" kind=" << state.kind <<
+			" camera=(" << state.camera[0] << ',' << state.camera[1] << ',' << state.camera[2] << ')' <<
+			" view=" << View);
+		return true;
+	}
+
+	void RestoreDarkenedSkyeCameraView(IDirect3DDevice9* Device, const D3DMATRIX& OldView, bool Applied)
+	{
+		if (Applied && Device)
+		{
+			Device->SetTransform(D3DTS_VIEW, &OldView);
+		}
+	}
 }
 
 // ******************************
@@ -3640,8 +3688,13 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 		// Handle dwFlags
 		SetDrawStates(FVF, dwFlags, DirectXVersion);
 
+		D3DMATRIX DarkenedSkyeOldView = {};
+		const bool DarkenedSkyeViewApplied = TryApplyDarkenedSkyeCameraView(*d3d9Device, FVF, DarkenedSkyeOldView);
+
 		// Draw primitive
 		HRESULT hr = (*d3d9Device)->DrawPrimitive(dptPrimitiveType, dwStartVertex, GetNumberOfPrimitives(dptPrimitiveType, dwNumVertices));
+
+		RestoreDarkenedSkyeCameraView(*d3d9Device, DarkenedSkyeOldView, DarkenedSkyeViewApplied);
 
 		// Handle dwFlags
 		RestoreDrawStates(hr, dwFlags, DirectXVersion);
@@ -3760,8 +3813,13 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveVB(D3DPRIMITIVETYPE dptPrimitive
 		// Handle dwFlags
 		SetDrawStates(FVF, dwFlags, DirectXVersion);
 
+		D3DMATRIX DarkenedSkyeOldView = {};
+		const bool DarkenedSkyeViewApplied = TryApplyDarkenedSkyeCameraView(*d3d9Device, FVF, DarkenedSkyeOldView);
+
 		// Draw primitive
 		HRESULT hr = (*d3d9Device)->DrawIndexedPrimitive(dptPrimitiveType, dwStartVertex, 0, dwNumVertices, 0, GetNumberOfPrimitives(dptPrimitiveType, dwIndexCount));
+
+		RestoreDarkenedSkyeCameraView(*d3d9Device, DarkenedSkyeOldView, DarkenedSkyeViewApplied);
 
 		// Handle dwFlags
 		RestoreDrawStates(hr, dwFlags, DirectXVersion);

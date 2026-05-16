@@ -8,6 +8,7 @@
 #include "DarkenedSkyeBridge.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 
@@ -165,6 +166,16 @@ namespace
 		float result = 0.0f;
 		std::memcpy(&result, &value, sizeof(result));
 		return result;
+	}
+
+	bool IsUsableFloat(float value)
+	{
+		return std::isfinite(value) && std::fabs(value) < 1.0e20f;
+	}
+
+	bool IsNearlyZero(float value)
+	{
+		return std::fabs(value) < 1.0e-5f;
 	}
 
 	const char* KindName(DWORD kind)
@@ -549,6 +560,82 @@ namespace
 			" matrix0_3=(" << BitsToFloat(transform.matrix[0]) << ',' << BitsToFloat(transform.matrix[1]) << ',' << BitsToFloat(transform.matrix[2]) << ',' << BitsToFloat(transform.matrix[3]) << ')' <<
 			" samples=" << FormatSamples(transform));
 	}
+}
+
+bool DarkenedSkyeBridge::GetLatestCameraState(CameraState* state)
+{
+	if (!state || !g_latestTransform.valid)
+	{
+		return false;
+	}
+
+	TransformSnapshot snapshot = g_latestTransform;
+	if (!snapshot.valid)
+	{
+		return false;
+	}
+
+	CameraState result = {};
+	result.serial = snapshot.serial;
+	result.site = snapshot.site;
+	result.kind = snapshot.kind;
+
+	bool anyCamera = false;
+	for (DWORD i = 0; i < ARRAYSIZE(result.camera); ++i)
+	{
+		result.camera[i] = BitsToFloat(snapshot.camera[i]);
+		anyCamera = anyCamera || !IsNearlyZero(result.camera[i]);
+		if (!IsUsableFloat(result.camera[i]))
+		{
+			return false;
+		}
+	}
+
+	bool anyMatrix = false;
+	for (DWORD i = 0; i < ARRAYSIZE(result.view); ++i)
+	{
+		result.view[i] = BitsToFloat(snapshot.matrix[i]);
+		anyMatrix = anyMatrix || !IsNearlyZero(result.view[i]);
+		if (!IsUsableFloat(result.view[i]))
+		{
+			return false;
+		}
+	}
+
+	if (!anyMatrix)
+	{
+		result.view[0] = 1.0f;
+		result.view[5] = 1.0f;
+		result.view[10] = 1.0f;
+	}
+
+	if (IsNearlyZero(result.view[15]))
+	{
+		result.view[15] = 1.0f;
+	}
+
+	const bool hasTranslation =
+		!IsNearlyZero(result.view[12]) ||
+		!IsNearlyZero(result.view[13]) ||
+		!IsNearlyZero(result.view[14]);
+
+	if (!hasTranslation && anyCamera)
+	{
+		const float cx = result.camera[0];
+		const float cy = result.camera[1];
+		const float cz = result.camera[2];
+		result.view[12] = -(result.view[0] * cx + result.view[4] * cy + result.view[8] * cz);
+		result.view[13] = -(result.view[1] * cx + result.view[5] * cy + result.view[9] * cz);
+		result.view[14] = -(result.view[2] * cx + result.view[6] * cy + result.view[10] * cz);
+	}
+
+	if (!anyMatrix && !anyCamera)
+	{
+		return false;
+	}
+
+	*state = result;
+	return true;
 }
 
 #if defined(_M_IX86)
