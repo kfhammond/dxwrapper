@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <sdkddkver.h>   // defines NTDDI_WIN10
+#include <emmintrin.h>
 
 #ifndef NTDDI_WIN10
 #include <intrin.h>
@@ -171,7 +172,7 @@ namespace
 	__forceinline typename std::enable_if<0 != count>::type loadSrcVectorRemainder(__m128i& vec,
 		const DWORD* src, int& offset, int delta, std::integral_constant<int, count>)
 	{
-		__m128i pixel = _mm_loadu_si32(src + (offset >> 16));
+		__m128i pixel = _mm_cvtsi32_si128(static_cast<int>(*(src + (offset >> 16))));
 		pixel = _mm_slli_si128(pixel, (pixelsPerVector - count) * 4);
 		vec = _mm_or_si128(vec, pixel);
 		offset += delta;

@@ -286,6 +286,8 @@ private:
 	HRESULT GetD9Transform(D3DTRANSFORMSTATETYPE State, D3DMATRIX* lpMatrix);
 	HRESULT SetD9Transform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* lpMatrix);
 	HRESULT D9MultiplyTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix);
+	void LogDarkenedSkyeDrawDiag(const char* FunctionName, D3DPRIMITIVETYPE PrimitiveType, DWORD OriginalVertexTypeDesc, DWORD EffectiveFVF, DWORD VertexCount, DWORD IndexCount, DWORD Flags, DWORD DirectXVersion, const void* Caller);
+	void LogDarkenedSkyeTransformDiag(const char* FunctionName, D3DTRANSFORMSTATETYPE State, const D3DMATRIX& Matrix);
 
 	void PrepDevice();
 	HRESULT RestoreStates();

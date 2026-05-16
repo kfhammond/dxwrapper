@@ -15,6 +15,93 @@
 */
 
 #include "ddraw.h"
+#include <intrin.h>
+#include <sstream>
+
+#if defined(_MSC_VER)
+#pragma intrinsic(_ReturnAddress)
+#endif
+
+namespace
+{
+	const BYTE* GetDarkenedSkyeExeImage(DWORD& ExeSize)
+	{
+		ExeSize = 0;
+
+		const auto exeBase = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+		if (exeBase)
+		{
+			const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exeBase);
+			if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+			{
+				const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exeBase + dos->e_lfanew);
+				if (nt->Signature == IMAGE_NT_SIGNATURE)
+				{
+					ExeSize = nt->OptionalHeader.SizeOfImage;
+				}
+			}
+		}
+
+		return exeBase;
+	}
+
+	std::string GetDarkenedSkyeCallerSummary(const void* Caller)
+	{
+		DWORD exeSize = 0;
+		const BYTE* exeBase = GetDarkenedSkyeExeImage(exeSize);
+		const auto addr = reinterpret_cast<const BYTE*>(Caller);
+
+		std::ostringstream stream;
+		stream << " caller=";
+		if (exeBase && exeSize && addr >= exeBase && addr < exeBase + exeSize)
+		{
+			stream << "Skye+0x" << std::hex << (addr - exeBase);
+		}
+		else if (Caller)
+		{
+			stream << "outside";
+		}
+		else
+		{
+			stream << "null";
+		}
+
+		return stream.str();
+	}
+
+	std::string GetDarkenedSkyeStackSummary()
+	{
+		void* frames[24] = {};
+		const USHORT frameCount = CaptureStackBackTrace(0, ARRAYSIZE(frames), frames, nullptr);
+
+		DWORD exeSize = 0;
+		const BYTE* exeBase = GetDarkenedSkyeExeImage(exeSize);
+
+		std::ostringstream stream;
+		stream << " stack=";
+		bool foundGameFrame = false;
+		for (USHORT i = 0; i < frameCount; ++i)
+		{
+			const auto addr = reinterpret_cast<BYTE*>(frames[i]);
+			if (exeBase && exeSize && addr >= exeBase && addr < exeBase + exeSize)
+			{
+				if (foundGameFrame)
+				{
+					stream << ",";
+				}
+				stream << "Skye+0x" << std::hex << (addr - exeBase);
+				foundGameFrame = true;
+			}
+		}
+
+		if (!foundGameFrame)
+		{
+			stream << "no-game-frames";
+		}
+
+		return stream.str();
+	}
+}
 
 // ******************************
 // IUnknown functions
@@ -155,6 +242,19 @@ HRESULT m_IDirect3DVertexBufferX::Lock(DWORD dwFlags, LPVOID* lplpData, LPDWORD 
 			(IsVBEmulated || (Config.DdrawVertexLockDiscard && !(dwFlags & DDLOCK_READONLY)) ? D3DLOCK_DISCARD : NULL) |
 			(Config.DdrawNoDrawBufferSysLock ? D3DLOCK_NOSYSLOCK : NULL);
 
+		const std::string caller = GetDarkenedSkyeCallerSummary(_ReturnAddress());
+		const std::string stack = GetDarkenedSkyeStackSummary();
+		LOG_LIMIT(120, "[DarkenedSkye-Dd7to9Diag] vb-lock"
+			" fvf=" << Logging::hex(VB.Desc.dwFVF) <<
+			" rhw=" << ((VB.Desc.dwFVF & D3DFVF_XYZRHW) != 0) <<
+			" vertices=" << VB.Desc.dwNumVertices <<
+			" size=" << VB.Size <<
+			" flags=" << Logging::hex(dwFlags) <<
+			" d3dFlags=" << Logging::hex(Flags) <<
+			" emulated=" << IsVBEmulated <<
+			caller.c_str() <<
+			stack.c_str());
+
 		// Handle emulated readonly
 		if (IsVBEmulated && (Flags & D3DLOCK_READONLY))
 		{
@@ -271,6 +371,17 @@ HRESULT m_IDirect3DVertexBufferX::Unlock()
 				}
 			}
 		}
+
+		const std::string caller = GetDarkenedSkyeCallerSummary(_ReturnAddress());
+		const std::string stack = GetDarkenedSkyeStackSummary();
+		LOG_LIMIT(120, "[DarkenedSkye-Dd7to9Diag] vb-unlock"
+			" fvf=" << Logging::hex(VB.Desc.dwFVF) <<
+			" rhw=" << ((VB.Desc.dwFVF & D3DFVF_XYZRHW) != 0) <<
+			" vertices=" << VB.Desc.dwNumVertices <<
+			" size=" << VB.Size <<
+			" emulated=" << IsVBEmulated <<
+			caller.c_str() <<
+			stack.c_str());
 
 		HRESULT hr = d3d9VertexBuffer->Unlock();
 
@@ -664,6 +775,15 @@ HRESULT m_IDirect3DVertexBufferX::CreateD3D9VertexBuffer()
 		((VB.Desc.dwCaps & D3DVBCAPS_WRITEONLY) || IsVBEmulated ? D3DUSAGE_WRITEONLY : 0) |
 		((VB.Desc.dwCaps & D3DVBCAPS_DONOTCLIP) ? D3DUSAGE_DONOTCLIP : 0);
 	d3d9VBDesc.Pool = (VB.Desc.dwCaps & D3DVBCAPS_SYSTEMMEMORY) ? D3DPOOL_SYSTEMMEM : D3DPOOL_DEFAULT;
+
+	LOG_LIMIT(80, "[DarkenedSkye-Dd7to9Diag] create-vb"
+		" sourceFVF=" << Logging::hex(VB.Desc.dwFVF) <<
+		" d3d9FVF=" << Logging::hex(d3d9VBDesc.FVF) <<
+		" sourceRhw=" << ((VB.Desc.dwFVF & D3DFVF_XYZRHW) != 0) <<
+		" d3d9Rhw=" << ((d3d9VBDesc.FVF & D3DFVF_XYZRHW) != 0) <<
+		" emulated=" << IsVBEmulated <<
+		" vertices=" << VB.Desc.dwNumVertices <<
+		" caps=" << Logging::hex(VB.Desc.dwCaps));
 
 	HRESULT hr = (*d3d9Device)->CreateVertexBuffer(d3d9VBDesc.Size, d3d9VBDesc.Usage, d3d9VBDesc.FVF, d3d9VBDesc.Pool, &d3d9VertexBuffer, nullptr);
 	if (FAILED(hr))
@@ -1187,6 +1307,20 @@ HRESULT m_IDirect3DVertexBufferX::ProcessVerticesUP(DWORD dwVertexOp, LPVOID lpD
 	D3DMATRIX matWorldView = {}, matWorldViewProj = {};
 	D3DXMatrixMultiply(&matWorldView, &matWorld, &matView);
 	D3DXMatrixMultiply(&matWorldViewProj, &matWorldView, &matProj);
+
+	LOG_LIMIT(120, "[DarkenedSkye-Dd7to9Diag] process-vertices"
+		" op=" << Logging::hex(dwVertexOp) <<
+		" srcFVF=" << Logging::hex(SrcFVF) <<
+		" destFVF=" << Logging::hex(DestFVF) <<
+		" srcRhw=" << (SrcPosFVF == D3DFVF_XYZRHW) <<
+		" destRhw=" << (DestPosFVF == D3DFVF_XYZRHW) <<
+		" count=" << dwCount <<
+		" srcIndex=" << dwSrcIndex <<
+		" destIndex=" << dwDestIndex <<
+		" flags=" << Logging::hex(dwFlags) <<
+		" world=" << matWorld <<
+		" view=" << matView <<
+		" projection=" << matProj);
 
 	// Get viewport
 	D3DVIEWPORT7 vp = {};

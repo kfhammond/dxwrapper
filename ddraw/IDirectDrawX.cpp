@@ -49,6 +49,49 @@ namespace {
 	// Display mode settings
 	DISPLAYSETTINGS DisplayMode = {};
 
+	struct ProcessWindowSearch
+	{
+		DWORD ProcessId = 0;
+		HWND Window = nullptr;
+	};
+
+	BOOL CALLBACK FindProcessWindowProc(HWND hWnd, LPARAM lParam)
+	{
+		auto* Search = reinterpret_cast<ProcessWindowSearch*>(lParam);
+		if (!Search || Search->Window || !IsWindowVisible(hWnd) || GetAncestor(hWnd, GA_ROOT) != hWnd)
+		{
+			return TRUE;
+		}
+
+		DWORD WindowProcessId = 0;
+		GetWindowThreadProcessId(hWnd, &WindowProcessId);
+		if (WindowProcessId == Search->ProcessId)
+		{
+			Search->Window = hWnd;
+			return FALSE;
+		}
+
+		return TRUE;
+	}
+
+	HWND FindFallbackProcessWindow()
+	{
+		DWORD WindowProcessId = 0;
+		HWND hWnd = GetForegroundWindow();
+		if (IsWindow(hWnd))
+		{
+			GetWindowThreadProcessId(hWnd, &WindowProcessId);
+			if (WindowProcessId == GetCurrentProcessId())
+			{
+				return hWnd;
+			}
+		}
+
+		ProcessWindowSearch Search = { GetCurrentProcessId(), nullptr };
+		EnumWindows(FindProcessWindowProc, reinterpret_cast<LPARAM>(&Search));
+		return Search.Window;
+	}
+
 	// Device settings
 	DEVICESETTINGS Device = {};
 
@@ -2991,6 +3034,17 @@ HWND m_IDirectDrawX::GetHwnd()
 		}
 
 		ClipperHWnd = nullptr;
+	}
+
+	if (Config.Dd7to9 && Config.DdrawIntroVideoFix)
+	{
+		HWND FallbackHWnd = FindFallbackProcessWindow();
+		if (IsWindow(FallbackHWnd))
+		{
+			DisplayMode.hWnd = FallbackHWnd;
+			DisplayMode.DC = ::GetDC(DisplayMode.hWnd);
+			return DisplayMode.hWnd;
+		}
 	}
 
 	return  nullptr;

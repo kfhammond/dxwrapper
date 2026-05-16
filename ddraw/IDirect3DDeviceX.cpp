@@ -17,8 +17,185 @@
 #include "ddraw.h"
 #include "d3d9\d3d9External.h"
 #include "Utils\Utils.h"
+#include <cmath>
+#include <intrin.h>
+#include <sstream>
 
 const DWORD ReserveCount = 64;
+
+#if defined(_MSC_VER)
+#pragma intrinsic(_ReturnAddress)
+#endif
+
+namespace
+{
+	const BYTE* GetDarkenedSkyeExeImage(DWORD& ExeSize)
+	{
+		ExeSize = 0;
+
+		const auto exeBase = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+		if (exeBase)
+		{
+			const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exeBase);
+			if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+			{
+				const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exeBase + dos->e_lfanew);
+				if (nt->Signature == IMAGE_NT_SIGNATURE)
+				{
+					ExeSize = nt->OptionalHeader.SizeOfImage;
+				}
+			}
+		}
+
+		return exeBase;
+	}
+
+	std::string GetDarkenedSkyeCallerSummary(const void* Caller)
+	{
+		DWORD exeSize = 0;
+		const BYTE* exeBase = GetDarkenedSkyeExeImage(exeSize);
+		const auto addr = reinterpret_cast<const BYTE*>(Caller);
+
+		std::ostringstream stream;
+		stream << " caller=";
+		if (exeBase && exeSize && addr >= exeBase && addr < exeBase + exeSize)
+		{
+			stream << "Skye+0x" << std::hex << (addr - exeBase);
+		}
+		else if (Caller)
+		{
+			stream << "outside";
+		}
+		else
+		{
+			stream << "null";
+		}
+
+		return stream.str();
+	}
+
+	const char* GetDarkenedSkyeTransformName(D3DTRANSFORMSTATETYPE State)
+	{
+		if (State == D3DTRANSFORMSTATE_WORLD || State == D3DTS_WORLD)
+		{
+			return "WORLD";
+		}
+		if (State == D3DTRANSFORMSTATE_VIEW || State == D3DTS_VIEW)
+		{
+			return "VIEW";
+		}
+		if (State == D3DTRANSFORMSTATE_PROJECTION || State == D3DTS_PROJECTION)
+		{
+			return "PROJECTION";
+		}
+		if (State == D3DTRANSFORMSTATE_WORLD1 || State == D3DTS_WORLD1)
+		{
+			return "WORLD1";
+		}
+		if (State == D3DTRANSFORMSTATE_WORLD2 || State == D3DTS_WORLD2)
+		{
+			return "WORLD2";
+		}
+		if (State == D3DTRANSFORMSTATE_WORLD3 || State == D3DTS_WORLD3)
+		{
+			return "WORLD3";
+		}
+
+		return "OTHER";
+	}
+
+	const char* GetDarkenedSkyeFvfPositionName(DWORD FVF)
+	{
+		switch (FVF & D3DFVF_POSITION_MASK)
+		{
+		case D3DFVF_XYZ:
+			return "XYZ";
+		case D3DFVF_XYZRHW:
+			return "XYZRHW";
+		case D3DFVF_XYZB1:
+			return "XYZB1";
+		case D3DFVF_XYZB2:
+			return "XYZB2";
+		case D3DFVF_XYZB3:
+			return "XYZB3";
+		case D3DFVF_XYZB4:
+			return "XYZB4";
+		case D3DFVF_XYZB5:
+			return "XYZB5";
+		default:
+			return "NONE";
+		}
+	}
+
+	const char* GetDarkenedSkyeOriginalVertexDescName(DWORD VertexTypeDesc, DWORD DirectXVersion)
+	{
+		if (DirectXVersion == 2)
+		{
+			switch (VertexTypeDesc)
+			{
+			case D3DVT_VERTEX:
+				return "D3DVT_VERTEX";
+			case D3DVT_LVERTEX:
+				return "D3DVT_LVERTEX";
+			case D3DVT_TLVERTEX:
+				return "D3DVT_TLVERTEX";
+			default:
+				return "D3DVT_UNKNOWN";
+			}
+		}
+
+		return GetDarkenedSkyeFvfPositionName(VertexTypeDesc);
+	}
+
+	bool IsDarkenedSkyeIdentityMatrix(const D3DMATRIX& Matrix)
+	{
+		const float* Value = &Matrix.m[0][0];
+		const float* Identity = &DefaultIdentityMatrix.m[0][0];
+
+		for (UINT i = 0; i < 16; ++i)
+		{
+			if (std::fabs(Value[i] - Identity[i]) > 0.0001f)
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	std::string GetDarkenedSkyeStackSummary()
+	{
+		void* frames[24] = {};
+		const USHORT frameCount = CaptureStackBackTrace(0, ARRAYSIZE(frames), frames, nullptr);
+
+		DWORD exeSize = 0;
+		const BYTE* exeBase = GetDarkenedSkyeExeImage(exeSize);
+
+		std::ostringstream stream;
+		stream << " stack=";
+		bool foundGameFrame = false;
+		for (USHORT i = 0; i < frameCount; ++i)
+		{
+			const auto addr = reinterpret_cast<BYTE*>(frames[i]);
+			if (exeBase && exeSize && addr >= exeBase && addr < exeBase + exeSize)
+			{
+				if (foundGameFrame)
+				{
+					stream << ",";
+				}
+				stream << "Skye+0x" << std::hex << (addr - exeBase);
+				foundGameFrame = true;
+			}
+		}
+
+		if (!foundGameFrame)
+		{
+			stream << "no-game-frames";
+		}
+
+		return stream.str();
+	}
+}
 
 // ******************************
 // IUnknown functions
@@ -2933,6 +3110,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 
 	if (Config.Dd7to9)
 	{
+		const DWORD OriginalVertexTypeDesc = dwVertexTypeDesc;
+
 		if (dwVertexCount == 0)
 		{
 			return D3D_OK; // Nothing to draw
@@ -2969,6 +3148,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitive(D3DPRIMITIVETYPE dptPrimitiveType, DWO
 
 		// Update vertices for Direct3D9 (needs to be first)
 		UpdateVertices(dwVertexTypeDesc, lpVertices, 0, dwVertexCount);
+
+		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, OriginalVertexTypeDesc, dwVertexTypeDesc, dwVertexCount, 0, dwFlags, DirectXVersion, _ReturnAddress());
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(dwVertexTypeDesc)))
@@ -3026,6 +3207,8 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 
 	if (Config.Dd7to9)
 	{
+		const DWORD OriginalVertexTypeDesc = dwVertexTypeDesc;
+
 		if (dwVertexCount == 0 || dwIndexCount == 0)
 		{
 			return D3D_OK; // Nothing to draw
@@ -3062,6 +3245,8 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitive(D3DPRIMITIVETYPE dptPrimitiveTy
 
 		// Update vertices for Direct3D9 (needs to be first)
 		UpdateVertices(dwVertexTypeDesc, lpVertices, 0, dwVertexCount);
+
+		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, OriginalVertexTypeDesc, dwVertexTypeDesc, dwVertexCount, dwIndexCount, dwFlags, DirectXVersion, _ReturnAddress());
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(dwVertexTypeDesc)))
@@ -3201,6 +3386,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveStrided(D3DPRIMITIVETYPE dptPrimitiveTy
 
 	if (Config.Dd7to9)
 	{
+		const DWORD OriginalVertexTypeDesc = dwVertexTypeDesc;
+
 		if (dwVertexCount == 0)
 		{
 			return D3D_OK; // Nothing to draw
@@ -3244,6 +3431,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveStrided(D3DPRIMITIVETYPE dptPrimitiveTy
 			LOG_LIMIT(100, __FUNCTION__ << " Error: invalid StridedVertexData!");
 			return DDERR_INVALIDPARAMS;
 		}
+
+		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, OriginalVertexTypeDesc, dwVertexTypeDesc, dwVertexCount, 0, dwFlags, DirectXVersion, _ReturnAddress());
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(dwVertexTypeDesc)))
@@ -3292,6 +3481,8 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveStrided(D3DPRIMITIVETYPE dptPrim
 
 	if (Config.Dd7to9)
 	{
+		const DWORD OriginalVertexTypeDesc = dwVertexTypeDesc;
+
 		if (dwVertexCount == 0 || dwIndexCount == 0)
 		{
 			return D3D_OK; // Nothing to draw
@@ -3342,6 +3533,8 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveStrided(D3DPRIMITIVETYPE dptPrim
 			LOG_LIMIT(100, __FUNCTION__ << " Error: invalid StridedVertexData!");
 			return DDERR_INVALIDPARAMS;
 		}
+
+		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, OriginalVertexTypeDesc, dwVertexTypeDesc, dwVertexCount, dwIndexCount, dwFlags, DirectXVersion, _ReturnAddress());
 
 		// Handle dwFlags
 		SetDrawStates(dwVertexTypeDesc, dwFlags, DirectXVersion);
@@ -3429,6 +3622,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 		}
 
 		DWORD FVF = pVertexBufferX->GetFVF9();
+
+		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, FVF, FVF, dwNumVertices, 0, dwFlags, DirectXVersion, _ReturnAddress());
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(FVF)))
@@ -3536,6 +3731,8 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveVB(D3DPRIMITIVETYPE dptPrimitive
 		}
 
 		DWORD FVF = pVertexBufferX->GetFVF9();
+
+		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, FVF, FVF, dwNumVertices, dwIndexCount, dwFlags, DirectXVersion, _ReturnAddress());
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(FVF)))
@@ -6272,6 +6469,8 @@ HRESULT m_IDirect3DDeviceX::SetD9Transform(D3DTRANSFORMSTATETYPE State, const D3
 
 	DeviceStates.Matrix[State] = *lpMatrix;
 
+	LogDarkenedSkyeTransformDiag(__FUNCTION__, State, *lpMatrix);
+
 	return D3D_OK;
 }
 
@@ -6299,9 +6498,53 @@ HRESULT m_IDirect3DDeviceX::D9MultiplyTransform(D3DTRANSFORMSTATETYPE State, con
 		BatchStates.Matrix[State] = result;
 
 		DeviceStates.Matrix[State] = result;
+
+		LogDarkenedSkyeTransformDiag(__FUNCTION__, State, result);
 	}
 
 	return hr;
+}
+
+void m_IDirect3DDeviceX::LogDarkenedSkyeDrawDiag(const char* FunctionName, D3DPRIMITIVETYPE PrimitiveType, DWORD OriginalVertexTypeDesc, DWORD EffectiveFVF, DWORD VertexCount, DWORD IndexCount, DWORD Flags, DWORD DirectXVersion, const void* Caller)
+{
+	D3DMATRIX World = {}, View = {}, Projection = {};
+	GetD9Transform(D3DTS_WORLD, &World);
+	GetD9Transform(D3DTS_VIEW, &View);
+	GetD9Transform(D3DTS_PROJECTION, &Projection);
+	const std::string caller = GetDarkenedSkyeCallerSummary(Caller);
+	const std::string stack = GetDarkenedSkyeStackSummary();
+
+	LOG_LIMIT(300, "[DarkenedSkye-Dd7to9Diag] draw"
+		" fn=" << FunctionName <<
+		" dx=" << DirectXVersion <<
+		" prim=" << Logging::hex(PrimitiveType) <<
+		" originalDesc=" << Logging::hex(OriginalVertexTypeDesc) <<
+		" originalKind=" << GetDarkenedSkyeOriginalVertexDescName(OriginalVertexTypeDesc, DirectXVersion) <<
+		" effectiveFVF=" << Logging::hex(EffectiveFVF) <<
+		" effectivePos=" << GetDarkenedSkyeFvfPositionName(EffectiveFVF) <<
+		" rhw=" << ((EffectiveFVF & D3DFVF_XYZRHW) != 0) <<
+		" normal=" << ((EffectiveFVF & D3DFVF_NORMAL) != 0) <<
+		" diffuse=" << ((EffectiveFVF & D3DFVF_DIFFUSE) != 0) <<
+		" specular=" << ((EffectiveFVF & D3DFVF_SPECULAR) != 0) <<
+		" texCount=" << D3DFVF_TEXCOUNT(EffectiveFVF) <<
+		" vertices=" << VertexCount <<
+		" indices=" << IndexCount <<
+		" flags=" << Logging::hex(Flags) <<
+		" worldIdentity=" << IsDarkenedSkyeIdentityMatrix(World) <<
+		" viewIdentity=" << IsDarkenedSkyeIdentityMatrix(View) <<
+		" projectionIdentity=" << IsDarkenedSkyeIdentityMatrix(Projection) <<
+		caller.c_str() <<
+		stack.c_str());
+}
+
+void m_IDirect3DDeviceX::LogDarkenedSkyeTransformDiag(const char* FunctionName, D3DTRANSFORMSTATETYPE State, const D3DMATRIX& Matrix)
+{
+	LOG_LIMIT(120, "[DarkenedSkye-Dd7to9Diag] transform"
+		" fn=" << FunctionName <<
+		" state=" << GetDarkenedSkyeTransformName(State) <<
+		" rawState=" << Logging::hex(State) <<
+		" identity=" << IsDarkenedSkyeIdentityMatrix(Matrix) <<
+		" matrix=" << Matrix);
 }
 
 void m_IDirect3DDeviceX::PrepDevice()

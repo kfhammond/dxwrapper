@@ -17,6 +17,12 @@
 #include <objbase.h>
 #include "ddraw.h"
 #include "Utils\Utils.h"
+#include <intrin.h>
+#include <sstream>
+
+#if defined(_MSC_VER)
+#pragma intrinsic(_ReturnAddress)
+#endif
 
 namespace {
 	bool GetD3DPath = true;
@@ -24,6 +30,84 @@ namespace {
 	char D3DIm700Path[MAX_PATH] = { '\0' };
 	HMODULE hD3DIm = nullptr;
 	HMODULE hD3DIm700 = nullptr;
+
+	const BYTE* GetDarkenedSkyeExeImage(DWORD& ExeSize)
+	{
+		ExeSize = 0;
+
+		const auto exeBase = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+		if (exeBase)
+		{
+			const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exeBase);
+			if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+			{
+				const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exeBase + dos->e_lfanew);
+				if (nt->Signature == IMAGE_NT_SIGNATURE)
+				{
+					ExeSize = nt->OptionalHeader.SizeOfImage;
+				}
+			}
+		}
+
+		return exeBase;
+	}
+
+	std::string GetDarkenedSkyeCallerSummary(const void* Caller)
+	{
+		DWORD exeSize = 0;
+		const BYTE* exeBase = GetDarkenedSkyeExeImage(exeSize);
+		const auto addr = reinterpret_cast<const BYTE*>(Caller);
+
+		std::ostringstream stream;
+		stream << " caller=";
+		if (exeBase && exeSize && addr >= exeBase && addr < exeBase + exeSize)
+		{
+			stream << "Skye+0x" << std::hex << (addr - exeBase);
+		}
+		else if (Caller)
+		{
+			stream << "outside";
+		}
+		else
+		{
+			stream << "null";
+		}
+
+		return stream.str();
+	}
+
+	std::string GetDarkenedSkyeStackSummary()
+	{
+		void* frames[24] = {};
+		const USHORT frameCount = CaptureStackBackTrace(0, ARRAYSIZE(frames), frames, nullptr);
+
+		DWORD exeSize = 0;
+		const BYTE* exeBase = GetDarkenedSkyeExeImage(exeSize);
+
+		std::ostringstream stream;
+		stream << " stack=";
+		bool foundGameFrame = false;
+		for (USHORT i = 0; i < frameCount; ++i)
+		{
+			const auto addr = reinterpret_cast<BYTE*>(frames[i]);
+			if (exeBase && exeSize && addr >= exeBase && addr < exeBase + exeSize)
+			{
+				if (foundGameFrame)
+				{
+					stream << ",";
+				}
+				stream << "Skye+0x" << std::hex << (addr - exeBase);
+				foundGameFrame = true;
+			}
+		}
+
+		if (!foundGameFrame)
+		{
+			stream << "no-game-frames";
+		}
+
+		return stream.str();
+	}
 }
 
 // ******************************
@@ -746,6 +830,19 @@ HRESULT m_IDirect3DX::CreateVertexBuffer(LPD3DVERTEXBUFFERDESC lpVBDesc, LPDIREC
 			LOG_LIMIT(100, __FUNCTION__ << " Error: no ddraw parent!");
 			return DDERR_INVALIDOBJECT;
 		}
+
+		const std::string caller = GetDarkenedSkyeCallerSummary(_ReturnAddress());
+		const std::string stack = GetDarkenedSkyeStackSummary();
+		LOG_LIMIT(80, "[DarkenedSkye-Dd7to9Diag] create-vb-api"
+			" fn=" << __FUNCTION__ <<
+			" dx=" << DirectXVersion <<
+			" fvf=" << Logging::hex(lpVBDesc->dwFVF) <<
+			" rhw=" << ((lpVBDesc->dwFVF & D3DFVF_XYZRHW) != 0) <<
+			" vertices=" << lpVBDesc->dwNumVertices <<
+			" caps=" << Logging::hex(lpVBDesc->dwCaps) <<
+			" flags=" << Logging::hex(dwFlags) <<
+			caller.c_str() <<
+			stack.c_str());
 
 		m_IDirect3DVertexBufferX* Interface = new m_IDirect3DVertexBufferX(ddrawParent, this, lpVBDesc, DxVersion);
 
