@@ -518,7 +518,7 @@ namespace
 
 		if (!preSubmit.valid || !preSubmit.transform.valid)
 		{
-			LOG_LIMIT(120, "[DarkenedSkye-Bridge] draw-missing-capture"
+			LOG_LIMIT(500, "[DarkenedSkye-Bridge] draw-missing-capture"
 				" function=" << functionName <<
 				" primitive=" << primitiveType <<
 				" fvf=" << Logging::hex(fvf) <<
@@ -529,7 +529,7 @@ namespace
 		}
 
 		const TransformSnapshot& transform = preSubmit.transform;
-		LOG_LIMIT(300, "[DarkenedSkye-Bridge] draw-pair"
+		LOG_LIMIT(10000, "[DarkenedSkye-Bridge] draw-pair"
 			" function=" << functionName <<
 			" primitive=" << primitiveType <<
 			" fvf=" << Logging::hex(fvf) <<
