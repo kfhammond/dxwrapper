@@ -39,6 +39,7 @@ namespace
 	constexpr bool kEnableScratchInPlaceReplay = true;
 	constexpr bool kEnableScratchReplayStitch = true;
 	constexpr bool kEnableIndexedPartialReplay = false;
+	constexpr bool kEnableIndexedScratchFallback = false;
 	constexpr DWORD kScratchBatchVertexCount = 3;
 	constexpr DWORD kMaxAccumulatedScratchReplayVertices = 4096;
 	constexpr float kMaxReplayTriangleEdgeLength = 4096.0f;
@@ -121,7 +122,7 @@ namespace
 		TransformSnapshot transform = {};
 	};
 
-	struct ScratchReplayAccumulator
+	struct ReplayAccumulator
 	{
 		volatile LONG valid = 0;
 		DWORD threadId = 0;
@@ -141,7 +142,8 @@ namespace
 	TransformSnapshot g_latestTransform = {};
 	TransformSnapshot g_latestIndexedTransform = {};
 	PreSubmitSnapshot g_latestPreSubmit = {};
-	ScratchReplayAccumulator g_scratchReplay = {};
+	ReplayAccumulator g_scratchReplay = {};
+	ReplayAccumulator g_indexedReplay = {};
 
 	DWORD VaToRuntime(DWORD va)
 	{
@@ -438,6 +440,17 @@ namespace
 		g_scratchReplay.latestTransform = {};
 	}
 
+	void ResetIndexedReplayAccumulator(DWORD threadId)
+	{
+		g_indexedReplay.valid = 0;
+		g_indexedReplay.threadId = threadId;
+		g_indexedReplay.vertexCount = 0;
+		g_indexedReplay.lastTransformSerial = 0;
+		g_indexedReplay.lastPreSubmitSite = 0;
+		g_indexedReplay.lastTick = 0;
+		g_indexedReplay.latestTransform = {};
+	}
+
 	bool ScratchSamplesUsable(const TransformSnapshot& transform)
 	{
 		if (transform.kind != SourceKindScratchInPlace ||
@@ -525,6 +538,103 @@ namespace
 		g_scratchReplay.lastTick = transform.tick;
 		g_scratchReplay.latestTransform = transform;
 		g_scratchReplay.valid = 1;
+	}
+
+	bool IndexedSamplesUsable(const TransformSnapshot& transform)
+	{
+		if (!IsIndexedKind(transform.kind) ||
+			transform.sampleCount < kScratchBatchVertexCount)
+		{
+			return false;
+		}
+
+		for (DWORD i = 0; i < kScratchBatchVertexCount; ++i)
+		{
+			const RawVertexSample& sample = transform.samples[i];
+			if (!sample.readable)
+			{
+				return false;
+			}
+
+			const float x = BitsToFloat(sample.x);
+			const float y = BitsToFloat(sample.y);
+			const float z = BitsToFloat(sample.z);
+			if (!IsUsableFloat(x) || !IsUsableFloat(y) || !IsUsableFloat(z) ||
+				MaxAbs3(x, y, z) < 4.0f)
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	void AppendIndexedReplayBatch(DWORD preSubmitSite, const TransformSnapshot& transform)
+	{
+		if (!IndexedSamplesUsable(transform))
+		{
+			return;
+		}
+
+		if (transform.serial == g_indexedReplay.lastTransformSerial &&
+			g_indexedReplay.threadId == transform.threadId)
+		{
+			return;
+		}
+
+		const DWORD expectedCursor = transform.tlVertexCursor;
+		if (!g_indexedReplay.valid ||
+			g_indexedReplay.threadId != transform.threadId ||
+			g_indexedReplay.latestTransform.kind != transform.kind ||
+			expectedCursor == 0 ||
+			expectedCursor < g_indexedReplay.vertexCount)
+		{
+			ResetIndexedReplayAccumulator(transform.threadId);
+			g_indexedReplay.valid = 1;
+		}
+
+		if (g_indexedReplay.vertexCount != expectedCursor)
+		{
+			LOG_LIMIT(240, "[DarkenedSkye-Bridge] indexed-accum-gap"
+				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmitSite)) <<
+				" transform=" << FormatSkyeAddress(VaToRuntime(transform.site)) <<
+				" expectedCursor=" << expectedCursor <<
+				" haveVertices=" << g_indexedReplay.vertexCount <<
+				" kind=" << KindName(transform.kind) <<
+				" serial=" << transform.serial);
+			g_indexedReplay.lastTransformSerial = transform.serial;
+			g_indexedReplay.lastPreSubmitSite = preSubmitSite;
+			g_indexedReplay.lastTick = transform.tick;
+			g_indexedReplay.latestTransform = transform;
+			return;
+		}
+
+		if (g_indexedReplay.vertexCount + kScratchBatchVertexCount > kMaxAccumulatedScratchReplayVertices)
+		{
+			LOG_LIMIT(40, "[DarkenedSkye-Bridge] indexed-accum-overflow"
+				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmitSite)) <<
+				" haveVertices=" << g_indexedReplay.vertexCount <<
+				" capacity=" << kMaxAccumulatedScratchReplayVertices);
+			ResetIndexedReplayAccumulator(transform.threadId);
+			return;
+		}
+
+		for (DWORD i = 0; i < kScratchBatchVertexCount; ++i)
+		{
+			const RawVertexSample& sample = transform.samples[i];
+			const DWORD dstVertex = g_indexedReplay.vertexCount + i;
+			float* dst = &g_indexedReplay.positions[dstVertex * 3];
+			dst[0] = BitsToFloat(sample.x);
+			dst[1] = BitsToFloat(sample.y);
+			dst[2] = BitsToFloat(sample.z);
+		}
+
+		g_indexedReplay.vertexCount += kScratchBatchVertexCount;
+		g_indexedReplay.lastTransformSerial = transform.serial;
+		g_indexedReplay.lastPreSubmitSite = preSubmitSite;
+		g_indexedReplay.lastTick = transform.tick;
+		g_indexedReplay.latestTransform = transform;
+		g_indexedReplay.valid = 1;
 	}
 
 	bool IsSkyeProcess()
@@ -785,13 +895,21 @@ namespace
 					" serialDelta=" << (g_latestTransform.serial - snapshot.transform.serial) <<
 					" tickDelta=" << (g_latestTransform.tick - snapshot.transform.tick));
 			}
-			else if (snapshot.transform.kind == SourceKindScratchInPlace)
+
+			if (snapshot.transform.kind == SourceKindScratchInPlace)
 			{
+				ResetIndexedReplayAccumulator(snapshot.threadId);
 				AppendScratchReplayBatch(site, snapshot.transform);
+			}
+			else if (IsIndexedKind(snapshot.transform.kind))
+			{
+				ResetScratchReplayAccumulator(snapshot.threadId);
+				AppendIndexedReplayBatch(site, snapshot.transform);
 			}
 			else
 			{
 				ResetScratchReplayAccumulator(snapshot.threadId);
+				ResetIndexedReplayAccumulator(snapshot.threadId);
 			}
 		}
 
@@ -1223,13 +1341,18 @@ namespace
 				return true;
 			}
 
-			if (ReadIndexedScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &indexedScratchReason))
+			if (kEnableIndexedScratchFallback &&
+				ReadIndexedScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &indexedScratchReason))
 			{
 				if (outReplaySource)
 				{
 					*outReplaySource = "indexedScratch";
 				}
 				return true;
+			}
+			else if (!kEnableIndexedScratchFallback)
+			{
+				indexedScratchReason = "indexed-scratch-disabled";
 			}
 
 			if (outReason)
@@ -1418,6 +1541,86 @@ namespace
 		ResetScratchReplayAccumulator(preSubmit.threadId);
 		return true;
 	}
+
+	bool TryConsumeAccumulatedIndexedReplay(const PreSubmitSnapshot& preSubmit, DWORD vertexCount, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	{
+		if (outVertexCount)
+		{
+			*outVertexCount = 0;
+		}
+		if (outReason)
+		{
+			*outReason = nullptr;
+		}
+
+		if (!positionsXyz || !outVertexCount || !vertexCount || maxVertices < vertexCount)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-accum-invalid-args";
+			}
+			return false;
+		}
+
+		if (!g_indexedReplay.valid || g_indexedReplay.threadId != preSubmit.threadId)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-accum-unavailable";
+			}
+			return false;
+		}
+
+		if (preSubmit.site && g_indexedReplay.lastPreSubmitSite && preSubmit.site != g_indexedReplay.lastPreSubmitSite)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-accum-site-mismatch";
+			}
+			ResetIndexedReplayAccumulator(preSubmit.threadId);
+			return false;
+		}
+
+		if (!HasNonZeroCamera(g_indexedReplay.latestTransform))
+		{
+			if (outReason)
+			{
+				*outReason = "zero-camera";
+			}
+			ResetIndexedReplayAccumulator(preSubmit.threadId);
+			return false;
+		}
+
+		if (g_indexedReplay.vertexCount != vertexCount)
+		{
+			*outVertexCount = g_indexedReplay.vertexCount;
+			if (outReason)
+			{
+				*outReason = "indexed-accum-count-mismatch";
+			}
+			LOG_LIMIT(400, "[DarkenedSkye-Bridge] indexed-accum-mismatch"
+				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmit.site)) <<
+				" requestedVertices=" << vertexCount <<
+				" haveVertices=" << g_indexedReplay.vertexCount <<
+				" lastPreSubmit=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.lastPreSubmitSite)) <<
+				" lastTransform=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.latestTransform.site)) <<
+				" kind=" << KindName(g_indexedReplay.latestTransform.kind));
+			ResetIndexedReplayAccumulator(preSubmit.threadId);
+			return false;
+		}
+
+		std::memcpy(positionsXyz, g_indexedReplay.positions, static_cast<size_t>(vertexCount) * 3 * sizeof(float));
+		*outVertexCount = vertexCount;
+		LOG_LIMIT(800, "[DarkenedSkye-Bridge] indexed-accum-consume"
+			" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmit.site)) <<
+			" vertices=" << vertexCount <<
+			" lastTransform=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.latestTransform.site)) <<
+			" kind=" << KindName(g_indexedReplay.latestTransform.kind) <<
+			" lastSerial=" << g_indexedReplay.lastTransformSerial <<
+			" lastTick=" << g_indexedReplay.lastTick);
+		ResetIndexedReplayAccumulator(preSubmit.threadId);
+		return true;
+	}
 }
 
 bool DarkenedSkyeBridge::GetLatestCameraState(CameraState* state)
@@ -1514,7 +1717,21 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 		{
 			ResetScratchReplayAccumulator(preSubmit.threadId);
 		}
-		replayReadSucceeded = ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason, &replaySource, &replayFallbackSkipReason);
+		if (IsIndexedKind(transform.kind) &&
+			g_indexedReplay.valid &&
+			g_indexedReplay.threadId == preSubmit.threadId)
+		{
+			replayReadSucceeded = TryConsumeAccumulatedIndexedReplay(preSubmit, VertexCount, PositionsXyz, MaxVertices, OutVertexCount, &replaySkipReason);
+			if (replayReadSucceeded)
+			{
+				replaySource = "indexedAccumulated";
+			}
+		}
+
+		if (!replayReadSucceeded)
+		{
+			replayReadSucceeded = ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason, &replaySource, &replayFallbackSkipReason);
+		}
 	}
 	else
 	{
