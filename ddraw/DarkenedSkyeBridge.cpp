@@ -38,6 +38,7 @@ namespace
 	constexpr DWORD kFvfXyzRhw = 0x004;
 	constexpr bool kEnableScratchInPlaceReplay = true;
 	constexpr bool kEnableScratchReplayStitch = true;
+	constexpr bool kEnableRawIndexedReplay = false;
 	constexpr bool kEnableIndexedPartialReplay = false;
 	constexpr bool kEnableIndexedScratchFallback = false;
 	constexpr DWORD kScratchBatchVertexCount = 3;
@@ -863,6 +864,7 @@ namespace
 		if (IsIndexedKind(snapshot.kind))
 		{
 			g_latestIndexedTransform = snapshot;
+			AppendIndexedReplayBatch(0, snapshot);
 		}
 	}
 
@@ -1332,13 +1334,18 @@ namespace
 		{
 			const char* indexedReason = nullptr;
 			const char* indexedScratchReason = nullptr;
-			if (ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &indexedReason))
+			if (kEnableRawIndexedReplay &&
+				ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &indexedReason))
 			{
 				if (outReplaySource)
 				{
 					*outReplaySource = "indexed";
 				}
 				return true;
+			}
+			else if (!kEnableRawIndexedReplay)
+			{
+				indexedReason = "indexed-raw-disabled";
 			}
 
 			if (kEnableIndexedScratchFallback &&
