@@ -181,6 +181,14 @@ namespace
 		return std::isfinite(value) && std::fabs(value) < 1.0e20f;
 	}
 
+	float MaxAbs3(float x, float y, float z)
+	{
+		const float ax = std::fabs(x);
+		const float ay = std::fabs(y);
+		const float az = std::fabs(z);
+		return ax > ay ? (ax > az ? ax : az) : (ay > az ? ay : az);
+	}
+
 	bool IsNearlyZero(float value)
 	{
 		return std::fabs(value) < 1.0e-5f;
@@ -663,6 +671,54 @@ namespace
 			" samples=" << FormatSamples(transform));
 	}
 
+	bool HasNonZeroCamera(const TransformSnapshot& transform)
+	{
+		for (DWORD i = 0; i < ARRAYSIZE(transform.camera); ++i)
+		{
+			const float value = BitsToFloat(transform.camera[i]);
+			if (!IsUsableFloat(value))
+			{
+				return false;
+			}
+
+			if (!IsNearlyZero(value))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	bool ReadReplayPosition(DWORD address, float* outXyz)
+	{
+		if (!address || !outXyz)
+		{
+			return false;
+		}
+
+		DWORD xyz[3] = {};
+		if (!TryRead(address, &xyz[0]) ||
+			!TryRead(address + 4, &xyz[1]) ||
+			!TryRead(address + 8, &xyz[2]))
+		{
+			return false;
+		}
+
+		const float x = BitsToFloat(xyz[0]);
+		const float y = BitsToFloat(xyz[1]);
+		const float z = BitsToFloat(xyz[2]);
+		if (!IsUsableFloat(x) || !IsUsableFloat(y) || !IsUsableFloat(z))
+		{
+			return false;
+		}
+
+		outXyz[0] = x;
+		outXyz[1] = y;
+		outXyz[2] = z;
+		return true;
+	}
+
 	bool ReadScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
 	{
 		if (!positionsXyz || !outVertexCount ||
@@ -676,30 +732,75 @@ namespace
 		DWORD count = 0;
 		for (; count < maxVertices; ++count)
 		{
-			DWORD xyz[3] = {};
 			const DWORD vertexAddress = transform.sourceCurrent + (count * transform.sourceStride);
-			if (!TryRead(vertexAddress, &xyz[0]) ||
-				!TryRead(vertexAddress + 4, &xyz[1]) ||
-				!TryRead(vertexAddress + 8, &xyz[2]))
+			if (!ReadReplayPosition(vertexAddress, &positionsXyz[count * 3]))
 			{
 				break;
 			}
-
-			const float x = BitsToFloat(xyz[0]);
-			const float y = BitsToFloat(xyz[1]);
-			const float z = BitsToFloat(xyz[2]);
-			if (!IsUsableFloat(x) || !IsUsableFloat(y) || !IsUsableFloat(z))
-			{
-				break;
-			}
-
-			positionsXyz[(count * 3) + 0] = x;
-			positionsXyz[(count * 3) + 1] = y;
-			positionsXyz[(count * 3) + 2] = z;
 		}
 
 		*outVertexCount = count;
 		return count == maxVertices;
+	}
+
+	bool ReadIndexedReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	{
+		if (!positionsXyz || !outVertexCount ||
+			(transform.kind != SourceKindIndexedEdiEdx && transform.kind != SourceKindIndexedEbpEsi) ||
+			!transform.sourceBase ||
+			!transform.indexBase ||
+			transform.sourceStride < 12 ||
+			transform.indexStride != 2)
+		{
+			return false;
+		}
+
+		DWORD count = 0;
+		for (; count < maxVertices; ++count)
+		{
+			WORD index = 0;
+			const DWORD indexAddress = transform.indexBase + (count * transform.indexStride);
+			if (!TryRead(indexAddress, &index))
+			{
+				break;
+			}
+
+			float* xyz = &positionsXyz[count * 3];
+			const DWORD vertexAddress = transform.sourceBase + (static_cast<DWORD>(index) * transform.sourceStride);
+			if (!ReadReplayPosition(vertexAddress, xyz))
+			{
+				break;
+			}
+
+			// Guard against adjacent unit-vector streams being mistaken for world positions.
+			if (MaxAbs3(xyz[0], xyz[1], xyz[2]) < 4.0f)
+			{
+				break;
+			}
+		}
+
+		*outVertexCount = count;
+		return count == maxVertices;
+	}
+
+	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	{
+		if (outVertexCount)
+		{
+			*outVertexCount = 0;
+		}
+
+		if (!HasNonZeroCamera(transform))
+		{
+			return false;
+		}
+
+		if (ReadScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount))
+		{
+			return true;
+		}
+
+		return ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount);
 	}
 }
 
@@ -776,7 +877,7 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	}
 
 	const TransformSnapshot& transform = preSubmit.transform;
-	if (!ReadScratchReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount))
+	if (!ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount))
 	{
 		LOG_LIMIT(200, "[DarkenedSkye-Bridge] replay-skip"
 			" reason=source-unavailable"
@@ -786,7 +887,9 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 			" kind=" << KindName(transform.kind) <<
 			" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
 			" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+			" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
 			" sourceStride=" << transform.sourceStride <<
+			" indexStride=" << transform.indexStride <<
 			" readVertices=" << *OutVertexCount);
 		return false;
 	}
@@ -796,8 +899,11 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 		" fvf=" << Logging::hex(FVF) <<
 		" vertices=" << VertexCount <<
 		" kind=" << KindName(transform.kind) <<
+		" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
 		" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
-		" sourceStride=" << transform.sourceStride);
+		" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
+		" sourceStride=" << transform.sourceStride <<
+		" indexStride=" << transform.indexStride);
 	return true;
 }
 
