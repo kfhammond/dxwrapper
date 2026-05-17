@@ -599,11 +599,11 @@ namespace
 		return result;
 	}
 
-	void LogDrawPair(const char* functionName, DWORD primitiveType, DWORD fvf, DWORD startVertex, DWORD vertexCount, DWORD indexCount, const void* caller)
+	bool ConsumePairedSnapshot(const char* functionName, DWORD primitiveType, DWORD fvf, DWORD vertexCount, DWORD indexCount, const void* caller, PreSubmitSnapshot* out)
 	{
 		if ((fvf & kFvfPositionMask) != kFvfXyzRhw)
 		{
-			return;
+			return false;
 		}
 
 		const DWORD threadId = GetCurrentThreadId();
@@ -629,9 +629,18 @@ namespace
 				" vertices=" << vertexCount <<
 				" indices=" << indexCount <<
 				" caller=" << FormatSkyeAddress(reinterpret_cast<DWORD>(caller)));
-			return;
+			return false;
 		}
 
+		if (out)
+		{
+			*out = preSubmit;
+		}
+		return true;
+	}
+
+	void LogDrawPair(const char* functionName, DWORD primitiveType, DWORD fvf, DWORD startVertex, DWORD vertexCount, DWORD indexCount, const void* caller, const PreSubmitSnapshot& preSubmit)
+	{
 		const TransformSnapshot& transform = preSubmit.transform;
 		LOG_LIMIT(10000, "[DarkenedSkye-Bridge] draw-pair"
 			" function=" << functionName <<
@@ -652,6 +661,45 @@ namespace
 			" camera=" << FormatFloat3(transform.camera) <<
 			" matrix0_3=(" << BitsToFloat(transform.matrix[0]) << ',' << BitsToFloat(transform.matrix[1]) << ',' << BitsToFloat(transform.matrix[2]) << ',' << BitsToFloat(transform.matrix[3]) << ')' <<
 			" samples=" << FormatSamples(transform));
+	}
+
+	bool ReadScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	{
+		if (!positionsXyz || !outVertexCount ||
+			transform.kind != SourceKindScratchInPlace ||
+			!transform.sourceCurrent ||
+			transform.sourceStride < 12)
+		{
+			return false;
+		}
+
+		DWORD count = 0;
+		for (; count < maxVertices; ++count)
+		{
+			DWORD xyz[3] = {};
+			const DWORD vertexAddress = transform.sourceCurrent + (count * transform.sourceStride);
+			if (!TryRead(vertexAddress, &xyz[0]) ||
+				!TryRead(vertexAddress + 4, &xyz[1]) ||
+				!TryRead(vertexAddress + 8, &xyz[2]))
+			{
+				break;
+			}
+
+			const float x = BitsToFloat(xyz[0]);
+			const float y = BitsToFloat(xyz[1]);
+			const float z = BitsToFloat(xyz[2]);
+			if (!IsUsableFloat(x) || !IsUsableFloat(y) || !IsUsableFloat(z))
+			{
+				break;
+			}
+
+			positionsXyz[(count * 3) + 0] = x;
+			positionsXyz[(count * 3) + 1] = y;
+			positionsXyz[(count * 3) + 2] = z;
+		}
+
+		*outVertexCount = count;
+		return count == maxVertices;
 	}
 }
 
@@ -702,6 +750,54 @@ bool DarkenedSkyeBridge::GetLatestCameraState(CameraState* state)
 	}
 
 	*state = result;
+	return true;
+}
+
+bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType, DWORD FVF, DWORD StartVertex, DWORD VertexCount, const void* Caller, float* PositionsXyz, DWORD MaxVertices, DWORD* OutVertexCount)
+{
+	MaybeInstall();
+
+	if (OutVertexCount)
+	{
+		*OutVertexCount = 0;
+	}
+
+	PreSubmitSnapshot preSubmit = {};
+	if (!ConsumePairedSnapshot("DrawPrimitiveVB", PrimitiveType, FVF, VertexCount, 0, Caller, &preSubmit))
+	{
+		return false;
+	}
+
+	LogDrawPair("DrawPrimitiveVB", PrimitiveType, FVF, StartVertex, VertexCount, 0, Caller, preSubmit);
+
+	if (!PositionsXyz || !OutVertexCount || !VertexCount || MaxVertices < VertexCount)
+	{
+		return false;
+	}
+
+	const TransformSnapshot& transform = preSubmit.transform;
+	if (!ReadScratchReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount))
+	{
+		LOG_LIMIT(200, "[DarkenedSkye-Bridge] replay-skip"
+			" reason=source-unavailable"
+			" primitive=" << PrimitiveType <<
+			" fvf=" << Logging::hex(FVF) <<
+			" vertices=" << VertexCount <<
+			" kind=" << KindName(transform.kind) <<
+			" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
+			" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+			" sourceStride=" << transform.sourceStride <<
+			" readVertices=" << *OutVertexCount);
+		return false;
+	}
+
+	LOG_LIMIT(200, "[DarkenedSkye-Bridge] replay-positions"
+		" primitive=" << PrimitiveType <<
+		" fvf=" << Logging::hex(FVF) <<
+		" vertices=" << VertexCount <<
+		" kind=" << KindName(transform.kind) <<
+		" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+		" sourceStride=" << transform.sourceStride);
 	return true;
 }
 
@@ -832,11 +928,19 @@ void DarkenedSkyeBridge::MaybeInstall()
 void DarkenedSkyeBridge::OnDd7to9DrawPrimitiveVB(DWORD PrimitiveType, DWORD FVF, DWORD StartVertex, DWORD VertexCount, const void* Caller)
 {
 	MaybeInstall();
-	LogDrawPair("DrawPrimitiveVB", PrimitiveType, FVF, StartVertex, VertexCount, 0, Caller);
+	PreSubmitSnapshot preSubmit = {};
+	if (ConsumePairedSnapshot("DrawPrimitiveVB", PrimitiveType, FVF, VertexCount, 0, Caller, &preSubmit))
+	{
+		LogDrawPair("DrawPrimitiveVB", PrimitiveType, FVF, StartVertex, VertexCount, 0, Caller, preSubmit);
+	}
 }
 
 void DarkenedSkyeBridge::OnDd7to9DrawIndexedPrimitiveVB(DWORD PrimitiveType, DWORD FVF, DWORD StartVertex, DWORD VertexCount, DWORD IndexCount, const void* Caller)
 {
 	MaybeInstall();
-	LogDrawPair("DrawIndexedPrimitiveVB", PrimitiveType, FVF, StartVertex, VertexCount, IndexCount, Caller);
+	PreSubmitSnapshot preSubmit = {};
+	if (ConsumePairedSnapshot("DrawIndexedPrimitiveVB", PrimitiveType, FVF, VertexCount, IndexCount, Caller, &preSubmit))
+	{
+		LogDrawPair("DrawIndexedPrimitiveVB", PrimitiveType, FVF, StartVertex, VertexCount, IndexCount, Caller, preSubmit);
+	}
 }

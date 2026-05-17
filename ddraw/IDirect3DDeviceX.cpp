@@ -244,6 +244,85 @@ namespace
 			Device->SetTransform(D3DTS_VIEW, &OldView);
 		}
 	}
+
+	struct DarkenedSkyeReplayBuffer
+	{
+		DWORD fvf = 0;
+		UINT stride = 0;
+		DWORD vertexCount = 0;
+		std::vector<BYTE> vertices;
+	};
+
+	bool BuildDarkenedSkyeReplayBuffer(
+		LPDIRECT3DVERTEXBUFFER9 SourceVertexBuffer,
+		DWORD SourceFVF,
+		DWORD StartVertex,
+		const std::vector<float>& PositionsXyz,
+		DWORD VertexCount,
+		DarkenedSkyeReplayBuffer& Replay)
+	{
+		if (!VertexCount || PositionsXyz.size() < (static_cast<size_t>(VertexCount) * 3))
+		{
+			return false;
+		}
+
+		const UINT sourceStride = GetVertexStride(SourceFVF);
+		DWORD replayFVF = D3DFVF_XYZ;
+		void* sourceData = nullptr;
+		bool sourceLocked = false;
+
+		const DWORD candidateReplayFVF = (SourceFVF & ~D3DFVF_POSITION_MASK) | D3DFVF_XYZ;
+		if (SourceVertexBuffer && sourceStride && IsValidFVF(candidateReplayFVF))
+		{
+			const UINT lockOffset = StartVertex * sourceStride;
+			const UINT lockSize = VertexCount * sourceStride;
+			HRESULT lockHr = SourceVertexBuffer->Lock(lockOffset, lockSize, &sourceData, D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK);
+			if (FAILED(lockHr))
+			{
+				lockHr = SourceVertexBuffer->Lock(lockOffset, lockSize, &sourceData, D3DLOCK_READONLY);
+			}
+
+			if (SUCCEEDED(lockHr) && sourceData)
+			{
+				sourceLocked = true;
+				replayFVF = candidateReplayFVF;
+			}
+			else
+			{
+				LOG_LIMIT(80, "[DarkenedSkye-Dd7to9Diag] replay-tl-read-failed"
+					" fvf=" << Logging::hex(SourceFVF) <<
+					" vertices=" << VertexCount <<
+					" hr=" << (D3DERR)lockHr);
+			}
+		}
+
+		Replay.fvf = replayFVF;
+		Replay.stride = GetVertexStride(Replay.fvf);
+		Replay.vertexCount = VertexCount;
+		Replay.vertices.assign(static_cast<size_t>(Replay.stride) * VertexCount, 0);
+
+		for (DWORD i = 0; i < VertexCount; ++i)
+		{
+			BYTE* dst = Replay.vertices.data() + (static_cast<size_t>(i) * Replay.stride);
+			if (sourceLocked)
+			{
+				const BYTE* src = static_cast<const BYTE*>(sourceData) + (static_cast<size_t>(i) * sourceStride);
+				ConvertVertex(dst, Replay.fvf, src, SourceFVF);
+			}
+
+			float* xyz = reinterpret_cast<float*>(dst);
+			xyz[0] = PositionsXyz[(static_cast<size_t>(i) * 3) + 0];
+			xyz[1] = PositionsXyz[(static_cast<size_t>(i) * 3) + 1];
+			xyz[2] = PositionsXyz[(static_cast<size_t>(i) * 3) + 2];
+		}
+
+		if (sourceLocked)
+		{
+			SourceVertexBuffer->Unlock();
+		}
+
+		return Replay.stride != 0 && !Replay.vertices.empty();
+	}
 }
 
 // ******************************
@@ -3673,7 +3752,30 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 		DWORD FVF = pVertexBufferX->GetFVF9();
 
 		LogDarkenedSkyeDrawDiag(__FUNCTION__, dptPrimitiveType, FVF, FVF, dwNumVertices, 0, dwFlags, DirectXVersion, _ReturnAddress());
-		DarkenedSkyeBridge::OnDd7to9DrawPrimitiveVB(dptPrimitiveType, FVF, dwStartVertex, dwNumVertices, _ReturnAddress());
+
+		std::vector<float> DarkenedSkyeReplayPositions;
+		DWORD DarkenedSkyeReplayVertexCount = 0;
+		if (Config.DdrawDarkenedSkyeBridge && ((FVF & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW))
+		{
+			DarkenedSkyeReplayPositions.resize(static_cast<size_t>(dwNumVertices) * 3);
+			if (!DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(
+				dptPrimitiveType,
+				FVF,
+				dwStartVertex,
+				dwNumVertices,
+				_ReturnAddress(),
+				DarkenedSkyeReplayPositions.data(),
+				dwNumVertices,
+				&DarkenedSkyeReplayVertexCount))
+			{
+				DarkenedSkyeReplayPositions.clear();
+				DarkenedSkyeReplayVertexCount = 0;
+			}
+		}
+		else
+		{
+			DarkenedSkyeBridge::OnDd7to9DrawPrimitiveVB(dptPrimitiveType, FVF, dwStartVertex, dwNumVertices, _ReturnAddress());
+		}
 
 		// Set fixed function vertex type
 		if (FAILED((*d3d9Device)->SetFVF(FVF)))
@@ -3693,6 +3795,32 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 
 		// Draw primitive
 		HRESULT hr = (*d3d9Device)->DrawPrimitive(dptPrimitiveType, dwStartVertex, GetNumberOfPrimitives(dptPrimitiveType, dwNumVertices));
+
+		if (DarkenedSkyeReplayVertexCount)
+		{
+			DarkenedSkyeReplayBuffer Replay = {};
+			if (BuildDarkenedSkyeReplayBuffer(d3d9VertexBuffer, FVF, dwStartVertex, DarkenedSkyeReplayPositions, DarkenedSkyeReplayVertexCount, Replay))
+			{
+				HRESULT replayHr = (*d3d9Device)->SetFVF(Replay.fvf);
+				if (SUCCEEDED(replayHr))
+				{
+					(*d3d9Device)->SetStreamSource(0, nullptr, 0, 0);
+					replayHr = (*d3d9Device)->DrawPrimitiveUP(
+						dptPrimitiveType,
+						GetNumberOfPrimitives(dptPrimitiveType, Replay.vertexCount),
+						Replay.vertices.data(),
+						Replay.stride);
+				}
+
+				LOG_LIMIT(200, "[DarkenedSkye-Dd7to9Diag] replay-draw"
+					" primitive=" << dptPrimitiveType <<
+					" sourceFVF=" << Logging::hex(FVF) <<
+					" replayFVF=" << Logging::hex(Replay.fvf) <<
+					" vertices=" << Replay.vertexCount <<
+					" stride=" << Replay.stride <<
+					" hr=" << (D3DERR)replayHr);
+			}
+		}
 
 		RestoreDarkenedSkyeCameraView(*d3d9Device, DarkenedSkyeOldView, DarkenedSkyeViewApplied);
 
