@@ -565,13 +565,17 @@ namespace
 		g_scratchReplay.valid = 1;
 	}
 
-	bool IndexedSamplesUsable(const TransformSnapshot& transform)
+	const char* GetIndexedSamplesRejectReason(const TransformSnapshot& transform)
 	{
 		const DWORD batchVertexCount = transform.batchVertexCount ? transform.batchVertexCount : kScratchBatchVertexCount;
-		if (!IsIndexedKind(transform.kind) ||
-			transform.sampleCount < batchVertexCount)
+		if (!IsIndexedKind(transform.kind))
 		{
-			return false;
+			return "not-indexed";
+		}
+
+		if (transform.sampleCount < batchVertexCount)
+		{
+			return "sample-count";
 		}
 
 		for (DWORD i = 0; i < batchVertexCount; ++i)
@@ -579,32 +583,54 @@ namespace
 			const RawVertexSample& sample = transform.samples[i];
 			if (!sample.readable)
 			{
-				return false;
+				return "sample-unreadable";
 			}
 
 			const float x = BitsToFloat(sample.x);
 			const float y = BitsToFloat(sample.y);
 			const float z = BitsToFloat(sample.z);
-			if (!IsUsableFloat(x) || !IsUsableFloat(y) || !IsUsableFloat(z) ||
-				MaxAbs3(x, y, z) < 4.0f)
+			if (!IsUsableFloat(x) || !IsUsableFloat(y) || !IsUsableFloat(z))
 			{
-				return false;
+				return "sample-invalid-float";
+			}
+
+			if (MaxAbs3(x, y, z) < 4.0f)
+			{
+				return "sample-vector-like";
 			}
 		}
 
-		return true;
+		return nullptr;
 	}
 
 	void AppendIndexedReplayBatch(DWORD preSubmitSite, const TransformSnapshot& transform)
 	{
-		if (!IndexedSamplesUsable(transform))
+		const char* rejectReason = GetIndexedSamplesRejectReason(transform);
+		if (rejectReason)
 		{
+			LOG_LIMIT(240, "[DarkenedSkye-Bridge] indexed-accum-reject"
+				" reason=" << rejectReason <<
+				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmitSite)) <<
+				" transform=" << FormatSkyeAddress(VaToRuntime(transform.site)) <<
+				" expectedCursor=" << transform.tlVertexCursor <<
+				" haveVertices=" << g_indexedReplay.vertexCount <<
+				" kind=" << KindName(transform.kind) <<
+				" batchVertices=" << transform.batchVertexCount <<
+				" sampleCount=" << transform.sampleCount <<
+				" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
+				" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
+				" serial=" << transform.serial <<
+				" samples=" << FormatSamples(transform));
 			return;
 		}
 
 		if (transform.serial == g_indexedReplay.lastTransformSerial &&
 			g_indexedReplay.threadId == transform.threadId)
 		{
+			if (preSubmitSite && !g_indexedReplay.lastPreSubmitSite)
+			{
+				g_indexedReplay.lastPreSubmitSite = preSubmitSite;
+			}
 			return;
 		}
 
