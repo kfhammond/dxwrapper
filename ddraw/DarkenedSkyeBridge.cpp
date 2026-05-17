@@ -1918,7 +1918,9 @@ extern "C" void* g_SkyeBridgeTrampoline44E6DA = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42A395 = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B042 = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B626 = nullptr;
+extern "C" void* g_SkyeBridgeTrampoline42B84C = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline439BFF = nullptr;
+extern "C" void* g_SkyeBridgeTrampoline44E69C = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline44E7E7 = nullptr;
 
 extern "C" void __cdecl SkyeBridge_CaptureTransform(DWORD site, const PushadFrame* frame)
@@ -1971,7 +1973,9 @@ SKYE_TRANSFORM_HOOK(SkyeBridge_Hook44E6DA, 0044E6DAh, g_SkyeBridgeTrampoline44E6
 SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook42A395, 0042A395h, g_SkyeBridgeTrampoline42A395)
 SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook42B042, 0042B042h, g_SkyeBridgeTrampoline42B042)
 SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook42B626, 0042B626h, g_SkyeBridgeTrampoline42B626)
+SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook42B84C, 0042B84Ch, g_SkyeBridgeTrampoline42B84C)
 SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook439BFF, 00439BFFh, g_SkyeBridgeTrampoline439BFF)
+SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook44E69C, 0044E69Ch, g_SkyeBridgeTrampoline44E69C)
 SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook44E7E7, 0044E7E7h, g_SkyeBridgeTrampoline44E7E7)
 #endif
 
@@ -2025,7 +2029,9 @@ void DarkenedSkyeBridge::MaybeInstall()
 	installed += InstallHook(0x0042A395, "SkyePreSubmit42A395", SkyeBridge_Hook42A395, &g_SkyeBridgeTrampoline42A395, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
 	installed += InstallHook(0x0042B042, "SkyePreSubmit42B042", SkyeBridge_Hook42B042, &g_SkyeBridgeTrampoline42B042, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
 	installed += InstallHook(0x0042B626, "SkyePreSubmit42B626", SkyeBridge_Hook42B626, &g_SkyeBridgeTrampoline42B626, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
+	installed += InstallHook(0x0042B84C, "SkyePreSubmit42B84C", SkyeBridge_Hook42B84C, &g_SkyeBridgeTrampoline42B84C, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
 	installed += InstallHook(0x00439BFF, "SkyePreSubmit439BFF", SkyeBridge_Hook439BFF, &g_SkyeBridgeTrampoline439BFF, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
+	installed += InstallHook(0x0044E69C, "SkyePreSubmit44E69C", SkyeBridge_Hook44E69C, &g_SkyeBridgeTrampoline44E69C, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
 	installed += InstallHook(0x0044E7E7, "SkyePreSubmit44E7E7", SkyeBridge_Hook44E7E7, &g_SkyeBridgeTrampoline44E7E7, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
 
 	g_installState = installed ? 2 : 3;
