@@ -719,12 +719,9 @@ namespace
 		return true;
 	}
 
-	bool ReadScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	bool ReadReplayPositionsFromAddress(DWORD sourceCurrent, DWORD sourceStride, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
 	{
-		if (!positionsXyz || !outVertexCount ||
-			transform.kind != SourceKindScratchInPlace ||
-			!transform.sourceCurrent ||
-			transform.sourceStride < 12)
+		if (!positionsXyz || !outVertexCount || !sourceCurrent || sourceStride < 12)
 		{
 			return false;
 		}
@@ -732,7 +729,7 @@ namespace
 		DWORD count = 0;
 		for (; count < maxVertices; ++count)
 		{
-			const DWORD vertexAddress = transform.sourceCurrent + (count * transform.sourceStride);
+			const DWORD vertexAddress = sourceCurrent + (count * sourceStride);
 			if (!ReadReplayPosition(vertexAddress, &positionsXyz[count * 3]))
 			{
 				break;
@@ -741,6 +738,43 @@ namespace
 
 		*outVertexCount = count;
 		return count == maxVertices;
+	}
+
+	bool ReadScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	{
+		if (transform.kind != SourceKindScratchInPlace)
+		{
+			return false;
+		}
+
+		return ReadReplayPositionsFromAddress(transform.sourceCurrent, transform.sourceStride, positionsXyz, maxVertices, outVertexCount);
+	}
+
+	bool ReadIndexedScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	{
+		if (!transform.sourceVertexPointer)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-scratch-unavailable";
+			}
+			return false;
+		}
+
+		if (!ReadReplayPositionsFromAddress(transform.sourceVertexPointer, 0x34, positionsXyz, maxVertices, outVertexCount))
+		{
+			if (outReason)
+			{
+				*outReason = *outVertexCount ? "indexed-scratch-position-read-failed" : "indexed-scratch-unavailable";
+			}
+			return false;
+		}
+
+		if (outReason)
+		{
+			*outReason = nullptr;
+		}
+		return true;
 	}
 
 	bool ReadIndexedReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
@@ -804,7 +838,7 @@ namespace
 		return success;
 	}
 
-	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason, const char** outReplaySource)
 	{
 		if (outVertexCount)
 		{
@@ -813,6 +847,10 @@ namespace
 		if (outReason)
 		{
 			*outReason = nullptr;
+		}
+		if (outReplaySource)
+		{
+			*outReplaySource = nullptr;
 		}
 
 		if (!HasNonZeroCamera(transform))
@@ -828,6 +866,10 @@ namespace
 		{
 			if (ReadScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount))
 			{
+				if (outReplaySource)
+				{
+					*outReplaySource = "scratch";
+				}
 				return true;
 			}
 
@@ -840,7 +882,30 @@ namespace
 
 		if (transform.kind == SourceKindIndexedEdiEdx || transform.kind == SourceKindIndexedEbpEsi)
 		{
-			return ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, outReason);
+			const char* indexedReason = nullptr;
+			if (ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &indexedReason))
+			{
+				if (outReplaySource)
+				{
+					*outReplaySource = "indexed";
+				}
+				return true;
+			}
+
+			if (ReadIndexedScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, outReason))
+			{
+				if (outReplaySource)
+				{
+					*outReplaySource = "indexedScratch";
+				}
+				return true;
+			}
+
+			if (outReason && indexedReason)
+			{
+				*outReason = indexedReason;
+			}
+			return false;
 		}
 
 		if (outReason)
@@ -925,7 +990,8 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 
 	const TransformSnapshot& transform = preSubmit.transform;
 	const char* replaySkipReason = nullptr;
-	if (!ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason))
+	const char* replaySource = nullptr;
+	if (!ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason, &replaySource))
 	{
 		if (replaySkipReason && std::strcmp(replaySkipReason, "zero-camera") == 0)
 		{
@@ -965,11 +1031,13 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 		" fvf=" << Logging::hex(FVF) <<
 		" vertices=" << VertexCount <<
 		" kind=" << KindName(transform.kind) <<
+		" replaySource=" << (replaySource ? replaySource : "unknown") <<
 		" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
 		" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
 		" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
 		" sourceStride=" << transform.sourceStride <<
-		" indexStride=" << transform.indexStride);
+		" indexStride=" << transform.indexStride <<
+		" readVertices=" << *OutVertexCount);
 	return true;
 }
 
