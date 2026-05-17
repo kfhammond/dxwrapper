@@ -38,8 +38,10 @@ namespace
 	constexpr DWORD kFvfXyzRhw = 0x004;
 	constexpr bool kEnableScratchInPlaceReplay = true;
 	constexpr bool kEnableScratchReplayStitch = true;
+	constexpr bool kEnableIndexedPartialReplay = false;
 	constexpr DWORD kScratchBatchVertexCount = 3;
 	constexpr DWORD kMaxAccumulatedScratchReplayVertices = 4096;
+	constexpr float kMaxReplayTriangleEdgeLength = 4096.0f;
 
 	enum SourceKind : DWORD
 	{
@@ -221,6 +223,14 @@ namespace
 	float LengthSq(const Vec3& value)
 	{
 		return Dot(value, value);
+	}
+
+	float DistanceSq(const float* a, const float* b)
+	{
+		const float dx = a[0] - b[0];
+		const float dy = a[1] - b[1];
+		const float dz = a[2] - b[2];
+		return (dx * dx) + (dy * dy) + (dz * dz);
 	}
 
 	bool Normalize(Vec3& value)
@@ -762,10 +772,10 @@ namespace
 		if (g_latestTransform.valid && g_latestTransform.threadId == snapshot.threadId)
 		{
 			snapshot.transform = g_latestTransform;
-			AppendScratchReplayBatch(site, snapshot.transform);
 
 			if (ShouldPreferIndexedForPreSubmit(snapshot.transform, g_latestIndexedTransform, snapshot.threadId))
 			{
+				ResetScratchReplayAccumulator(snapshot.threadId);
 				snapshot.transform = g_latestIndexedTransform;
 				LOG_LIMIT(400, "[DarkenedSkye-Bridge] pre-submit-transform-override"
 					" preSubmit=" << FormatSkyeAddress(VaToRuntime(site)) <<
@@ -774,6 +784,14 @@ namespace
 					" transform=" << FormatSkyeAddress(VaToRuntime(snapshot.transform.site)) <<
 					" serialDelta=" << (g_latestTransform.serial - snapshot.transform.serial) <<
 					" tickDelta=" << (g_latestTransform.tick - snapshot.transform.tick));
+			}
+			else if (snapshot.transform.kind == SourceKindScratchInPlace)
+			{
+				AppendScratchReplayBatch(site, snapshot.transform);
+			}
+			else
+			{
+				ResetScratchReplayAccumulator(snapshot.threadId);
 			}
 		}
 
@@ -1252,6 +1270,78 @@ namespace
 		}
 	}
 
+	bool ValidateReplayGeometry(DWORD primitiveType, const float* positionsXyz, DWORD vertexCount, const char** outReason, float* outMaxEdge)
+	{
+		if (outReason)
+		{
+			*outReason = nullptr;
+		}
+		if (outMaxEdge)
+		{
+			*outMaxEdge = 0.0f;
+		}
+
+		if (!positionsXyz || !vertexCount)
+		{
+			if (outReason)
+			{
+				*outReason = "replay-empty";
+			}
+			return false;
+		}
+
+		for (DWORD i = 0; i < vertexCount; ++i)
+		{
+			const float* xyz = &positionsXyz[i * 3];
+			if (!IsUsableFloat(xyz[0]) || !IsUsableFloat(xyz[1]) || !IsUsableFloat(xyz[2]))
+			{
+				if (outReason)
+				{
+					*outReason = "replay-invalid-float";
+				}
+				return false;
+			}
+		}
+
+		if (primitiveType != 4)
+		{
+			return true;
+		}
+
+		const float maxEdgeSq = kMaxReplayTriangleEdgeLength * kMaxReplayTriangleEdgeLength;
+		float largestEdgeSq = 0.0f;
+		for (DWORD i = 0; i + 2 < vertexCount; i += 3)
+		{
+			const float* v0 = &positionsXyz[(i + 0) * 3];
+			const float* v1 = &positionsXyz[(i + 1) * 3];
+			const float* v2 = &positionsXyz[(i + 2) * 3];
+			const float e01 = DistanceSq(v0, v1);
+			const float e12 = DistanceSq(v1, v2);
+			const float e20 = DistanceSq(v2, v0);
+			float triangleMax = e01 > e12 ? e01 : e12;
+			triangleMax = triangleMax > e20 ? triangleMax : e20;
+			largestEdgeSq = largestEdgeSq > triangleMax ? largestEdgeSq : triangleMax;
+			if (!IsUsableFloat(triangleMax) || triangleMax > maxEdgeSq)
+			{
+				if (outMaxEdge)
+				{
+					*outMaxEdge = std::sqrt(triangleMax);
+				}
+				if (outReason)
+				{
+					*outReason = "triangle-edge-too-large";
+				}
+				return false;
+			}
+		}
+
+		if (outMaxEdge)
+		{
+			*outMaxEdge = std::sqrt(largestEdgeSq);
+		}
+		return true;
+	}
+
 	bool TryConsumeAccumulatedScratchReplay(const PreSubmitSnapshot& preSubmit, DWORD vertexCount, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
 	{
 		if (outVertexCount)
@@ -1407,7 +1497,8 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	const char* replaySource = nullptr;
 	const char* replayFallbackSkipReason = nullptr;
 	bool replayReadSucceeded = false;
-	if (g_scratchReplay.valid &&
+	if (transform.kind == SourceKindScratchInPlace &&
+		g_scratchReplay.valid &&
 		g_scratchReplay.threadId == preSubmit.threadId &&
 		(!preSubmit.site || !g_scratchReplay.lastPreSubmitSite || preSubmit.site == g_scratchReplay.lastPreSubmitSite))
 	{
@@ -1419,6 +1510,10 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	}
 	else if (transform.kind != SourceKindScratchInPlace)
 	{
+		if (g_scratchReplay.valid && g_scratchReplay.threadId == preSubmit.threadId)
+		{
+			ResetScratchReplayAccumulator(preSubmit.threadId);
+		}
 		replayReadSucceeded = ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason, &replaySource, &replayFallbackSkipReason);
 	}
 	else
@@ -1455,6 +1550,15 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 					" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
 					" sourceStride=" << transform.sourceStride <<
 					" indexStride=" << transform.indexStride);
+			}
+		}
+
+		if (allowPartialReplay)
+		{
+			if (!kEnableIndexedPartialReplay)
+			{
+				allowPartialReplay = false;
+				replaySkipReason = "partial-replay-disabled";
 			}
 		}
 
@@ -1507,6 +1611,29 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 				" indexStride=" << transform.indexStride <<
 				" readVertices=" << *OutVertexCount);
 		}
+		return false;
+	}
+
+	const char* validationReason = nullptr;
+	float maxReplayEdge = 0.0f;
+	if (!ValidateReplayGeometry(PrimitiveType, PositionsXyz, *OutVertexCount, &validationReason, &maxReplayEdge))
+	{
+		LOG_LIMIT(1000, "[DarkenedSkye-Bridge] replay-skip"
+			" reason=" << (validationReason ? validationReason : "replay-validation-failed") <<
+			" fallbackReason=none"
+			" primitive=" << PrimitiveType <<
+			" fvf=" << Logging::hex(FVF) <<
+			" vertices=" << VertexCount <<
+			" kind=" << KindName(transform.kind) <<
+			" replaySource=" << (replaySource ? replaySource : "unknown") <<
+			" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
+			" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+			" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
+			" sourceStride=" << transform.sourceStride <<
+			" indexStride=" << transform.indexStride <<
+			" readVertices=" << *OutVertexCount <<
+			" maxEdge=" << maxReplayEdge);
+		*OutVertexCount = 0;
 		return false;
 	}
 
