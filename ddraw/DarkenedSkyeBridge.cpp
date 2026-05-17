@@ -31,6 +31,7 @@ namespace
 	constexpr DWORD kCameraYVa = 0x00506ECC;
 	constexpr DWORD kCameraZVa = 0x00506ED0;
 	constexpr DWORD kMatrixBaseVa = 0x00506F14;
+	constexpr DWORD kMatrixFloatCount = 12;
 
 	constexpr DWORD kFvfPositionMask = 0x00E;
 	constexpr DWORD kFvfXyzRhw = 0x004;
@@ -93,6 +94,13 @@ namespace
 		DWORD indexStride = 0;
 		RawVertexSample samples[4] = {};
 		DWORD sampleCount = 0;
+	};
+
+	struct Vec3
+	{
+		float x = 0.0f;
+		float y = 0.0f;
+		float z = 0.0f;
 	};
 
 	struct PreSubmitSnapshot
@@ -176,6 +184,91 @@ namespace
 	bool IsNearlyZero(float value)
 	{
 		return std::fabs(value) < 1.0e-5f;
+	}
+
+	float Dot(const Vec3& a, const Vec3& b)
+	{
+		return (a.x * b.x) + (a.y * b.y) + (a.z * b.z);
+	}
+
+	float LengthSq(const Vec3& value)
+	{
+		return Dot(value, value);
+	}
+
+	bool Normalize(Vec3& value)
+	{
+		const float lengthSq = LengthSq(value);
+		if (lengthSq < 1.0e-8f || !IsUsableFloat(lengthSq))
+		{
+			return false;
+		}
+
+		const float invLength = 1.0f / std::sqrt(lengthSq);
+		value.x *= invLength;
+		value.y *= invLength;
+		value.z *= invLength;
+		return IsUsableFloat(value.x) && IsUsableFloat(value.y) && IsUsableFloat(value.z);
+	}
+
+	bool IsUsableVec3(const Vec3& value)
+	{
+		return IsUsableFloat(value.x) && IsUsableFloat(value.y) && IsUsableFloat(value.z);
+	}
+
+	bool BuildViewFromNativeMatrix(const float native[kMatrixFloatCount], const float camera[3], bool anyCamera, float view[16])
+	{
+		Vec3 right = { native[0], native[1], native[2] };
+		Vec3 up = { native[3], native[4], native[5] };
+		Vec3 forward = { native[6], native[7], native[8] };
+		Vec3 translation = { native[9], native[10], native[11] };
+
+		if (!IsUsableVec3(right) || !IsUsableVec3(up) || !IsUsableVec3(forward) ||
+			!Normalize(right) || !Normalize(up) || !Normalize(forward))
+		{
+			return false;
+		}
+
+		if (std::fabs(Dot(right, up)) > 0.02f ||
+			std::fabs(Dot(right, forward)) > 0.02f ||
+			std::fabs(Dot(up, forward)) > 0.02f)
+		{
+			return false;
+		}
+
+		if (anyCamera)
+		{
+			const Vec3 eye = { camera[0], camera[1], camera[2] };
+			if (!IsUsableVec3(eye))
+			{
+				return false;
+			}
+
+			translation.x = -Dot(right, eye);
+			translation.y = -Dot(up, eye);
+			translation.z = -Dot(forward, eye);
+		}
+
+		if (!IsUsableVec3(translation))
+		{
+			return false;
+		}
+
+		std::fill(view, view + 16, 0.0f);
+		view[0] = right.x;
+		view[1] = up.x;
+		view[2] = forward.x;
+		view[4] = right.y;
+		view[5] = up.y;
+		view[6] = forward.y;
+		view[8] = right.z;
+		view[9] = up.z;
+		view[10] = forward.z;
+		view[12] = translation.x;
+		view[13] = translation.y;
+		view[14] = translation.z;
+		view[15] = 1.0f;
+		return true;
 	}
 
 	const char* KindName(DWORD kind)
@@ -320,7 +413,7 @@ namespace
 		TryRead(VaToRuntime(kCameraXVa), &snapshot->camera[0]);
 		TryRead(VaToRuntime(kCameraYVa), &snapshot->camera[1]);
 		TryRead(VaToRuntime(kCameraZVa), &snapshot->camera[2]);
-		for (DWORD i = 0; i < ARRAYSIZE(snapshot->matrix); ++i)
+		for (DWORD i = 0; i < kMatrixFloatCount; ++i)
 		{
 			TryRead(VaToRuntime(kMatrixBaseVa + (i * sizeof(DWORD))), &snapshot->matrix[i]);
 		}
@@ -591,45 +684,19 @@ bool DarkenedSkyeBridge::GetLatestCameraState(CameraState* state)
 		}
 	}
 
+	float nativeMatrix[kMatrixFloatCount] = {};
 	bool anyMatrix = false;
-	for (DWORD i = 0; i < ARRAYSIZE(result.view); ++i)
+	for (DWORD i = 0; i < ARRAYSIZE(nativeMatrix); ++i)
 	{
-		result.view[i] = BitsToFloat(snapshot.matrix[i]);
-		anyMatrix = anyMatrix || !IsNearlyZero(result.view[i]);
-		if (!IsUsableFloat(result.view[i]))
+		nativeMatrix[i] = BitsToFloat(snapshot.matrix[i]);
+		anyMatrix = anyMatrix || !IsNearlyZero(nativeMatrix[i]);
+		if (!IsUsableFloat(nativeMatrix[i]))
 		{
 			return false;
 		}
 	}
 
-	if (!anyMatrix)
-	{
-		result.view[0] = 1.0f;
-		result.view[5] = 1.0f;
-		result.view[10] = 1.0f;
-	}
-
-	if (IsNearlyZero(result.view[15]))
-	{
-		result.view[15] = 1.0f;
-	}
-
-	const bool hasTranslation =
-		!IsNearlyZero(result.view[12]) ||
-		!IsNearlyZero(result.view[13]) ||
-		!IsNearlyZero(result.view[14]);
-
-	if (!hasTranslation && anyCamera)
-	{
-		const float cx = result.camera[0];
-		const float cy = result.camera[1];
-		const float cz = result.camera[2];
-		result.view[12] = -(result.view[0] * cx + result.view[4] * cy + result.view[8] * cz);
-		result.view[13] = -(result.view[1] * cx + result.view[5] * cy + result.view[9] * cz);
-		result.view[14] = -(result.view[2] * cx + result.view[6] * cy + result.view[10] * cz);
-	}
-
-	if (!anyMatrix && !anyCamera)
+	if (!anyMatrix || !BuildViewFromNativeMatrix(nativeMatrix, result.camera, anyCamera, result.view))
 	{
 		return false;
 	}
