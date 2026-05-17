@@ -50,7 +50,8 @@ namespace
 		SourceKindNone = 0,
 		SourceKindScratchInPlace = 1,
 		SourceKindIndexedEdiEdx = 2,
-		SourceKindIndexedEbpEsi = 3
+		SourceKindIndexedEbpEsi = 3,
+		SourceKindIndexedEbpEdx = 4
 	};
 
 	struct PushadFrame
@@ -101,6 +102,7 @@ namespace
 		DWORD indexBase = 0;
 		DWORD sourceStride = 0;
 		DWORD indexStride = 0;
+		DWORD batchVertexCount = 0;
 		RawVertexSample samples[4] = {};
 		DWORD sampleCount = 0;
 	};
@@ -313,7 +315,26 @@ namespace
 
 	bool IsIndexedKind(DWORD kind)
 	{
-		return kind == SourceKindIndexedEdiEdx || kind == SourceKindIndexedEbpEsi;
+		return kind == SourceKindIndexedEdiEdx ||
+			kind == SourceKindIndexedEbpEsi ||
+			kind == SourceKindIndexedEbpEdx;
+	}
+
+	DWORD BatchVertexCountForSite(DWORD site)
+	{
+		switch (site)
+		{
+		case 0x0042B66B:
+			return 4;
+		case 0x0042A25F:
+		case 0x0042AF0C:
+		case 0x0042B445:
+		case 0x0044E5DC:
+		case 0x0044E6DA:
+			return kScratchBatchVertexCount;
+		default:
+			return 0;
+		}
 	}
 
 	bool ShouldPreferIndexedForPreSubmit(const TransformSnapshot& selected, const TransformSnapshot& indexed, DWORD threadId)
@@ -368,6 +389,8 @@ namespace
 			return "indexedWorldEdiEdx";
 		case SourceKindIndexedEbpEsi:
 			return "indexedWorldEbpEsi";
+		case SourceKindIndexedEbpEdx:
+			return "indexedWorldEbpEdx";
 		default:
 			return "none";
 		}
@@ -543,13 +566,14 @@ namespace
 
 	bool IndexedSamplesUsable(const TransformSnapshot& transform)
 	{
+		const DWORD batchVertexCount = transform.batchVertexCount ? transform.batchVertexCount : kScratchBatchVertexCount;
 		if (!IsIndexedKind(transform.kind) ||
-			transform.sampleCount < kScratchBatchVertexCount)
+			transform.sampleCount < batchVertexCount)
 		{
 			return false;
 		}
 
-		for (DWORD i = 0; i < kScratchBatchVertexCount; ++i)
+		for (DWORD i = 0; i < batchVertexCount; ++i)
 		{
 			const RawVertexSample& sample = transform.samples[i];
 			if (!sample.readable)
@@ -610,7 +634,8 @@ namespace
 			return;
 		}
 
-		if (g_indexedReplay.vertexCount + kScratchBatchVertexCount > kMaxAccumulatedScratchReplayVertices)
+		const DWORD batchVertexCount = transform.batchVertexCount ? transform.batchVertexCount : kScratchBatchVertexCount;
+		if (g_indexedReplay.vertexCount + batchVertexCount > kMaxAccumulatedScratchReplayVertices)
 		{
 			LOG_LIMIT(40, "[DarkenedSkye-Bridge] indexed-accum-overflow"
 				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmitSite)) <<
@@ -620,7 +645,7 @@ namespace
 			return;
 		}
 
-		for (DWORD i = 0; i < kScratchBatchVertexCount; ++i)
+		for (DWORD i = 0; i < batchVertexCount; ++i)
 		{
 			const RawVertexSample& sample = transform.samples[i];
 			const DWORD dstVertex = g_indexedReplay.vertexCount + i;
@@ -630,7 +655,7 @@ namespace
 			dst[2] = BitsToFloat(sample.z);
 		}
 
-		g_indexedReplay.vertexCount += kScratchBatchVertexCount;
+		g_indexedReplay.vertexCount += batchVertexCount;
 		g_indexedReplay.lastTransformSerial = transform.serial;
 		g_indexedReplay.lastPreSubmitSite = preSubmitSite;
 		g_indexedReplay.lastTick = transform.tick;
@@ -772,19 +797,20 @@ namespace
 		}
 	}
 
-	void CaptureIndexedSamples(TransformSnapshot* snapshot, DWORD vertexBase, DWORD indexBase)
+	void CaptureIndexedSamples(TransformSnapshot* snapshot, DWORD vertexBase, DWORD indexBase, DWORD sampleCount)
 	{
 		if (!snapshot)
 		{
 			return;
 		}
 
+		const DWORD clampedSampleCount = std::min<DWORD>(sampleCount, ARRAYSIZE(snapshot->samples));
 		snapshot->sourceBase = vertexBase;
 		snapshot->sourceCurrent = vertexBase;
 		snapshot->indexBase = indexBase;
 		snapshot->sourceStride = 12;
 		snapshot->indexStride = 2;
-		snapshot->sampleCount = 4;
+		snapshot->sampleCount = clampedSampleCount;
 
 		for (DWORD i = 0; i < snapshot->sampleCount; ++i)
 		{
@@ -810,6 +836,8 @@ namespace
 		case 0x0042B445:
 		case 0x0042B66B:
 			return SourceKindIndexedEdiEdx;
+		case 0x0044E5DC:
+			return SourceKindIndexedEbpEdx;
 		case 0x0044E6DA:
 			return SourceKindIndexedEbpEsi;
 		default:
@@ -830,6 +858,7 @@ namespace
 		snapshot.kind = KindForSite(site);
 		snapshot.tick = GetTickCount();
 		snapshot.regs = *frame;
+		snapshot.batchVertexCount = BatchVertexCountForSite(site);
 		SnapshotGlobals(&snapshot);
 
 		switch (snapshot.kind)
@@ -849,10 +878,13 @@ namespace
 			}
 			break;
 		case SourceKindIndexedEdiEdx:
-			CaptureIndexedSamples(&snapshot, snapshot.regs.edi, snapshot.regs.edx);
+			CaptureIndexedSamples(&snapshot, snapshot.regs.edi, snapshot.regs.edx, snapshot.batchVertexCount);
 			break;
 		case SourceKindIndexedEbpEsi:
-			CaptureIndexedSamples(&snapshot, snapshot.regs.ebp, snapshot.regs.esi);
+			CaptureIndexedSamples(&snapshot, snapshot.regs.ebp, snapshot.regs.esi, snapshot.batchVertexCount);
+			break;
+		case SourceKindIndexedEbpEdx:
+			CaptureIndexedSamples(&snapshot, snapshot.regs.ebp, snapshot.regs.edx, snapshot.batchVertexCount);
 			break;
 		default:
 			return;
@@ -1005,6 +1037,7 @@ namespace
 			" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
 			" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
 			" sourceCount=" << transform.sourceVertexCount <<
+			" batchVertices=" << transform.batchVertexCount <<
 			" tlCursor=" << transform.tlVertexCursor <<
 			" tlVB=" << FormatSkyeAddress(transform.sharedTlVertexBuffer) <<
 			" camera=" << FormatFloat3(transform.camera) <<
@@ -1203,7 +1236,7 @@ namespace
 	bool ReadIndexedReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
 	{
 		if (!positionsXyz || !outVertexCount ||
-			(transform.kind != SourceKindIndexedEdiEdx && transform.kind != SourceKindIndexedEbpEsi) ||
+			!IsIndexedKind(transform.kind) ||
 			!transform.sourceBase ||
 			!transform.indexBase ||
 			transform.sourceStride < 12 ||
@@ -1330,7 +1363,7 @@ namespace
 			return false;
 		}
 
-		if (transform.kind == SourceKindIndexedEdiEdx || transform.kind == SourceKindIndexedEbpEsi)
+		if (IsIndexedKind(transform.kind))
 		{
 			const char* indexedReason = nullptr;
 			const char* indexedScratchReason = nullptr;
@@ -1748,8 +1781,7 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	if (!replayReadSucceeded)
 	{
 		bool allowPartialReplay = false;
-		const bool partialAllowedForKind =
-			(transform.kind == SourceKindIndexedEdiEdx || transform.kind == SourceKindIndexedEbpEsi);
+		const bool partialAllowedForKind = IsIndexedKind(transform.kind);
 		if (partialAllowedForKind && replaySkipReason && std::strcmp(replaySkipReason, "position-read-failed") == 0 && *OutVertexCount)
 		{
 			const DWORD alignedVertexCount = AlignReplayVertexCountForPrimitive(PrimitiveType, *OutVertexCount);
@@ -1881,6 +1913,7 @@ extern "C" void* g_SkyeBridgeTrampoline42A25F = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42AF0C = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B445 = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B66B = nullptr;
+extern "C" void* g_SkyeBridgeTrampoline44E5DC = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline44E6DA = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42A395 = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B042 = nullptr;
@@ -1932,6 +1965,7 @@ SKYE_TRANSFORM_HOOK(SkyeBridge_Hook42A25F, 0042A25Fh, g_SkyeBridgeTrampoline42A2
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook42AF0C, 0042AF0Ch, g_SkyeBridgeTrampoline42AF0C)
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook42B445, 0042B445h, g_SkyeBridgeTrampoline42B445)
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook42B66B, 0042B66Bh, g_SkyeBridgeTrampoline42B66B)
+SKYE_TRANSFORM_HOOK(SkyeBridge_Hook44E5DC, 0044E5DCh, g_SkyeBridgeTrampoline44E5DC)
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook44E6DA, 0044E6DAh, g_SkyeBridgeTrampoline44E6DA)
 
 SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook42A395, 0042A395h, g_SkyeBridgeTrampoline42A395)
@@ -1976,6 +2010,7 @@ void DarkenedSkyeBridge::MaybeInstall()
 	static const BYTE k42AF0C[] = { 0x8B, 0x0D, 0x0C, 0xAF, 0x52, 0x00 };
 	static const BYTE k42B445[] = { 0x33, 0xC0, 0x66, 0x8B, 0x02 };
 	static const BYTE k42B66B[] = { 0x33, 0xC0, 0x66, 0x8B, 0x02 };
+	static const BYTE k44E5DC[] = { 0x33, 0xC0, 0x83, 0xC1, 0x34, 0x66, 0x8B, 0x02 };
 	static const BYTE k44E6DA[] = { 0x8B, 0xD6, 0xB9, 0xA8, 0xED, 0x4F, 0x00 };
 	static const BYTE kPreSubmit[] = { 0xFF, 0x15, 0xC4, 0xC9, 0x54, 0x00 };
 
@@ -1984,6 +2019,7 @@ void DarkenedSkyeBridge::MaybeInstall()
 	installed += InstallHook(0x0042AF0C, "SkyeTransform42AF0C", SkyeBridge_Hook42AF0C, &g_SkyeBridgeTrampoline42AF0C, k42AF0C, sizeof(k42AF0C)) ? 1 : 0;
 	installed += InstallHook(0x0042B445, "SkyeTransform42B445", SkyeBridge_Hook42B445, &g_SkyeBridgeTrampoline42B445, k42B445, sizeof(k42B445)) ? 1 : 0;
 	installed += InstallHook(0x0042B66B, "SkyeTransform42B66B", SkyeBridge_Hook42B66B, &g_SkyeBridgeTrampoline42B66B, k42B66B, sizeof(k42B66B)) ? 1 : 0;
+	installed += InstallHook(0x0044E5DC, "SkyeTransform44E5DC", SkyeBridge_Hook44E5DC, &g_SkyeBridgeTrampoline44E5DC, k44E5DC, sizeof(k44E5DC)) ? 1 : 0;
 	installed += InstallHook(0x0044E6DA, "SkyeTransform44E6DA", SkyeBridge_Hook44E6DA, &g_SkyeBridgeTrampoline44E6DA, k44E6DA, sizeof(k44E6DA)) ? 1 : 0;
 
 	installed += InstallHook(0x0042A395, "SkyePreSubmit42A395", SkyeBridge_Hook42A395, &g_SkyeBridgeTrampoline42A395, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;
