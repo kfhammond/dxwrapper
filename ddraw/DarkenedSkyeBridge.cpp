@@ -743,7 +743,7 @@ namespace
 		return count == maxVertices;
 	}
 
-	bool ReadIndexedReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	bool ReadIndexedReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
 	{
 		if (!positionsXyz || !outVertexCount ||
 			(transform.kind != SourceKindIndexedEdiEdx && transform.kind != SourceKindIndexedEbpEsi) ||
@@ -752,6 +752,10 @@ namespace
 			transform.sourceStride < 12 ||
 			transform.indexStride != 2)
 		{
+			if (outReason)
+			{
+				*outReason = "indexed-source-unavailable";
+			}
 			return false;
 		}
 
@@ -762,6 +766,10 @@ namespace
 			const DWORD indexAddress = transform.indexBase + (count * transform.indexStride);
 			if (!TryRead(indexAddress, &index))
 			{
+				if (outReason)
+				{
+					*outReason = "index-read-failed";
+				}
 				break;
 			}
 
@@ -769,38 +777,77 @@ namespace
 			const DWORD vertexAddress = transform.sourceBase + (static_cast<DWORD>(index) * transform.sourceStride);
 			if (!ReadReplayPosition(vertexAddress, xyz))
 			{
+				if (outReason)
+				{
+					*outReason = "position-read-failed";
+				}
 				break;
 			}
 
 			// Guard against adjacent unit-vector streams being mistaken for world positions.
 			if (MaxAbs3(xyz[0], xyz[1], xyz[2]) < 4.0f)
 			{
+				if (outReason)
+				{
+					*outReason = "indexed-vector-reject";
+				}
 				break;
 			}
 		}
 
 		*outVertexCount = count;
-		return count == maxVertices;
+		const bool success = count == maxVertices;
+		if (success && outReason)
+		{
+			*outReason = nullptr;
+		}
+		return success;
 	}
 
-	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
 	{
 		if (outVertexCount)
 		{
 			*outVertexCount = 0;
 		}
+		if (outReason)
+		{
+			*outReason = nullptr;
+		}
 
 		if (!HasNonZeroCamera(transform))
 		{
+			if (outReason)
+			{
+				*outReason = "zero-camera";
+			}
 			return false;
 		}
 
-		if (ReadScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount))
+		if (transform.kind == SourceKindScratchInPlace)
 		{
-			return true;
+			if (ReadScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount))
+			{
+				return true;
+			}
+
+			if (outReason)
+			{
+				*outReason = *outVertexCount ? "position-read-failed" : "scratch-source-unavailable";
+			}
+			return false;
 		}
 
-		return ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount);
+		if (transform.kind == SourceKindIndexedEdiEdx || transform.kind == SourceKindIndexedEbpEsi)
+		{
+			return ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, outReason);
+		}
+
+		if (outReason)
+		{
+			*outReason = "unsupported-kind";
+		}
+		return false;
 	}
 }
 
@@ -877,24 +924,43 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	}
 
 	const TransformSnapshot& transform = preSubmit.transform;
-	if (!ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount))
+	const char* replaySkipReason = nullptr;
+	if (!ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason))
 	{
-		LOG_LIMIT(200, "[DarkenedSkye-Bridge] replay-skip"
-			" reason=source-unavailable"
-			" primitive=" << PrimitiveType <<
-			" fvf=" << Logging::hex(FVF) <<
-			" vertices=" << VertexCount <<
-			" kind=" << KindName(transform.kind) <<
-			" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
-			" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
-			" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
-			" sourceStride=" << transform.sourceStride <<
-			" indexStride=" << transform.indexStride <<
-			" readVertices=" << *OutVertexCount);
+		if (replaySkipReason && std::strcmp(replaySkipReason, "zero-camera") == 0)
+		{
+			LOG_LIMIT(80, "[DarkenedSkye-Bridge] replay-skip"
+				" reason=" << replaySkipReason <<
+				" primitive=" << PrimitiveType <<
+				" fvf=" << Logging::hex(FVF) <<
+				" vertices=" << VertexCount <<
+				" kind=" << KindName(transform.kind) <<
+				" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
+				" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+				" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
+				" sourceStride=" << transform.sourceStride <<
+				" indexStride=" << transform.indexStride <<
+				" readVertices=" << *OutVertexCount);
+		}
+		else
+		{
+			LOG_LIMIT(1000, "[DarkenedSkye-Bridge] replay-skip"
+				" reason=" << (replaySkipReason ? replaySkipReason : "source-unavailable") <<
+				" primitive=" << PrimitiveType <<
+				" fvf=" << Logging::hex(FVF) <<
+				" vertices=" << VertexCount <<
+				" kind=" << KindName(transform.kind) <<
+				" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
+				" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+				" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
+				" sourceStride=" << transform.sourceStride <<
+				" indexStride=" << transform.indexStride <<
+				" readVertices=" << *OutVertexCount);
+		}
 		return false;
 	}
 
-	LOG_LIMIT(200, "[DarkenedSkye-Bridge] replay-positions"
+	LOG_LIMIT(1000, "[DarkenedSkye-Bridge] replay-positions"
 		" primitive=" << PrimitiveType <<
 		" fvf=" << Logging::hex(FVF) <<
 		" vertices=" << VertexCount <<
