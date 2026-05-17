@@ -145,6 +145,7 @@ namespace
 	TransformSnapshot g_latestTransform = {};
 	TransformSnapshot g_latestIndexedTransform = {};
 	PreSubmitSnapshot g_latestPreSubmit = {};
+	PreSubmitSnapshot g_lastConsumedPreSubmit = {};
 	ReplayAccumulator g_scratchReplay = {};
 	ReplayAccumulator g_indexedReplay = {};
 
@@ -893,6 +894,10 @@ namespace
 		snapshot.serial = static_cast<DWORD>(InterlockedIncrement(&g_nextSerial));
 		snapshot.valid = 1;
 		g_latestTransform = snapshot;
+		if (g_lastConsumedPreSubmit.valid && g_lastConsumedPreSubmit.threadId == snapshot.threadId)
+		{
+			g_lastConsumedPreSubmit.valid = 0;
+		}
 		if (IsIndexedKind(snapshot.kind))
 		{
 			g_latestIndexedTransform = snapshot;
@@ -950,6 +955,10 @@ namespace
 		snapshot.serial = static_cast<DWORD>(InterlockedIncrement(&g_nextSerial));
 		snapshot.valid = 1;
 		g_latestPreSubmit = snapshot;
+		if (g_lastConsumedPreSubmit.valid && g_lastConsumedPreSubmit.threadId == snapshot.threadId)
+		{
+			g_lastConsumedPreSubmit.valid = 0;
+		}
 	}
 
 	void* InstallHook(DWORD va, const char* name, void* hookProc, void** trampoline, const BYTE* expected, size_t expectedSize)
@@ -980,6 +989,36 @@ namespace
 		return result;
 	}
 
+	bool TryReuseConsumedPreSubmit(DWORD threadId, PreSubmitSnapshot* out)
+	{
+		if (!g_lastConsumedPreSubmit.valid ||
+			g_lastConsumedPreSubmit.threadId != threadId ||
+			!g_lastConsumedPreSubmit.site ||
+			!g_lastConsumedPreSubmit.transform.valid)
+		{
+			return false;
+		}
+
+		if (g_latestTransform.valid &&
+			g_latestTransform.threadId == threadId &&
+			g_latestTransform.serial != g_lastConsumedPreSubmit.transform.serial)
+		{
+			return false;
+		}
+
+		const DWORD tickDelta = GetTickCount() - g_lastConsumedPreSubmit.tick;
+		if (tickDelta > 250)
+		{
+			return false;
+		}
+
+		if (out)
+		{
+			*out = g_lastConsumedPreSubmit;
+		}
+		return true;
+	}
+
 	bool ConsumePairedSnapshot(const char* functionName, DWORD primitiveType, DWORD fvf, DWORD vertexCount, DWORD indexCount, const void* caller, PreSubmitSnapshot* out)
 	{
 		if ((fvf & kFvfPositionMask) != kFvfXyzRhw)
@@ -993,6 +1032,20 @@ namespace
 		{
 			preSubmit = g_latestPreSubmit;
 			g_latestPreSubmit.valid = 0;
+			g_lastConsumedPreSubmit = preSubmit;
+		}
+		else if (TryReuseConsumedPreSubmit(threadId, &preSubmit))
+		{
+			LOG_LIMIT(600, "[DarkenedSkye-Bridge] pre-submit-reuse"
+				" function=" << functionName <<
+				" primitive=" << primitiveType <<
+				" vertices=" << vertexCount <<
+				" indices=" << indexCount <<
+				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmit.site)) <<
+				" transform=" << FormatSkyeAddress(VaToRuntime(preSubmit.transform.site)) <<
+				" kind=" << KindName(preSubmit.transform.kind) <<
+				" tickDelta=" << (GetTickCount() - preSubmit.tick) <<
+				" caller=" << FormatSkyeAddress(reinterpret_cast<DWORD>(caller)));
 		}
 		else if (g_latestTransform.valid && g_latestTransform.threadId == threadId)
 		{
