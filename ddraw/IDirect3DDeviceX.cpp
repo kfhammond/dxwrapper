@@ -3792,24 +3792,157 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 
 		D3DMATRIX DarkenedSkyeOldView = {};
 		const bool DarkenedSkyeViewApplied = TryApplyDarkenedSkyeCameraView(*d3d9Device, FVF, DarkenedSkyeOldView);
+		const bool darkenedSkyeSkipOriginalForReplay =
+			Config.DdrawDarkenedSkyeReplayVisibilityTest &&
+			DarkenedSkyeReplayVertexCount >= 96;
 
 		// Draw primitive
-		HRESULT hr = (*d3d9Device)->DrawPrimitive(dptPrimitiveType, dwStartVertex, GetNumberOfPrimitives(dptPrimitiveType, dwNumVertices));
+		HRESULT hr = D3D_OK;
+		if (!darkenedSkyeSkipOriginalForReplay)
+		{
+			hr = (*d3d9Device)->DrawPrimitive(dptPrimitiveType, dwStartVertex, GetNumberOfPrimitives(dptPrimitiveType, dwNumVertices));
+		}
+		else
+		{
+			LOG_LIMIT(400, "[DarkenedSkye-Dd7to9Diag] replay-skip-original"
+				" primitive=" << dptPrimitiveType <<
+				" sourceFVF=" << Logging::hex(FVF) <<
+				" vertices=" << dwNumVertices <<
+				" replayVertices=" << DarkenedSkyeReplayVertexCount);
+		}
 
 		if (DarkenedSkyeReplayVertexCount)
 		{
 			DarkenedSkyeReplayBuffer Replay = {};
 			if (BuildDarkenedSkyeReplayBuffer(d3d9VertexBuffer, FVF, dwStartVertex, DarkenedSkyeReplayPositions, DarkenedSkyeReplayVertexCount, Replay))
 			{
+				const bool replayVisibilityTest = Config.DdrawDarkenedSkyeReplayVisibilityTest;
+				if (replayVisibilityTest)
+				{
+					Replay.fvf = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+					Replay.stride = (sizeof(float) * 3) + sizeof(DWORD);
+					Replay.vertices.assign(static_cast<size_t>(Replay.stride) * Replay.vertexCount, 0);
+
+					for (DWORD i = 0; i < Replay.vertexCount; ++i)
+					{
+						BYTE* dst = Replay.vertices.data() + (static_cast<size_t>(i) * Replay.stride);
+						float* xyz = reinterpret_cast<float*>(dst);
+						xyz[0] = DarkenedSkyeReplayPositions[(static_cast<size_t>(i) * 3) + 0];
+						xyz[1] = DarkenedSkyeReplayPositions[(static_cast<size_t>(i) * 3) + 1];
+						xyz[2] = DarkenedSkyeReplayPositions[(static_cast<size_t>(i) * 3) + 2];
+
+						DWORD* diffuse = reinterpret_cast<DWORD*>(dst + (sizeof(float) * 3));
+						*diffuse = 0xFF00FF00;
+					}
+				}
+
 				HRESULT replayHr = (*d3d9Device)->SetFVF(Replay.fvf);
+				HRESULT replayTargetHr = D3D_OK;
+				bool replayBackBufferApplied = false;
+				IDirect3DSurface9* replayPreviousRt = nullptr;
+				IDirect3DSurface9* replayBackBuffer = nullptr;
+				IDirect3DBaseTexture9* replayTexture0 = nullptr;
+				bool replayDebugStateApplied = false;
+				DWORD replayOldZEnable = TRUE;
+				DWORD replayOldZWriteEnable = TRUE;
+				DWORD replayOldAlphaBlendEnable = FALSE;
+				DWORD replayOldCullMode = D3DCULL_CCW;
+				DWORD replayOldColorOp = D3DTOP_MODULATE;
+				DWORD replayOldColorArg1 = D3DTA_TEXTURE;
+				DWORD replayOldColorArg2 = D3DTA_DIFFUSE;
+				DWORD replayOldAlphaOp = D3DTOP_SELECTARG1;
+				DWORD replayOldAlphaArg1 = D3DTA_TEXTURE;
+				DWORD replayOldAlphaArg2 = D3DTA_DIFFUSE;
 				if (SUCCEEDED(replayHr))
 				{
+					if (replayVisibilityTest)
+					{
+						(*d3d9Device)->GetRenderState(D3DRS_ZENABLE, &replayOldZEnable);
+						(*d3d9Device)->GetRenderState(D3DRS_ZWRITEENABLE, &replayOldZWriteEnable);
+						(*d3d9Device)->GetRenderState(D3DRS_ALPHABLENDENABLE, &replayOldAlphaBlendEnable);
+						(*d3d9Device)->GetRenderState(D3DRS_CULLMODE, &replayOldCullMode);
+						(*d3d9Device)->GetTextureStageState(0, D3DTSS_COLOROP, &replayOldColorOp);
+						(*d3d9Device)->GetTextureStageState(0, D3DTSS_COLORARG1, &replayOldColorArg1);
+						(*d3d9Device)->GetTextureStageState(0, D3DTSS_COLORARG2, &replayOldColorArg2);
+						(*d3d9Device)->GetTextureStageState(0, D3DTSS_ALPHAOP, &replayOldAlphaOp);
+						(*d3d9Device)->GetTextureStageState(0, D3DTSS_ALPHAARG1, &replayOldAlphaArg1);
+						(*d3d9Device)->GetTextureStageState(0, D3DTSS_ALPHAARG2, &replayOldAlphaArg2);
+						(*d3d9Device)->GetTexture(0, &replayTexture0);
+
+						(*d3d9Device)->SetRenderState(D3DRS_ZENABLE, FALSE);
+						(*d3d9Device)->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+						(*d3d9Device)->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+						(*d3d9Device)->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+						(*d3d9Device)->SetTexture(0, nullptr);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
+						replayDebugStateApplied = true;
+					}
+
+					if (Config.DdrawDarkenedSkyeReplayToBackBuffer)
+					{
+						replayTargetHr = (*d3d9Device)->GetRenderTarget(0, &replayPreviousRt);
+						if (SUCCEEDED(replayTargetHr))
+						{
+							replayTargetHr = (*d3d9Device)->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &replayBackBuffer);
+						}
+						if (SUCCEEDED(replayTargetHr))
+						{
+							replayTargetHr = (*d3d9Device)->SetRenderTarget(0, replayBackBuffer);
+							replayBackBufferApplied = SUCCEEDED(replayTargetHr);
+						}
+
+						if (!replayBackBufferApplied)
+						{
+							LOG_LIMIT(200, "[DarkenedSkye-Dd7to9Diag] replay-target-skip"
+								" target=backBuffer"
+								" hr=" << (D3DERR)replayTargetHr);
+						}
+					}
+
 					(*d3d9Device)->SetStreamSource(0, nullptr, 0, 0);
 					replayHr = (*d3d9Device)->DrawPrimitiveUP(
 						dptPrimitiveType,
 						GetNumberOfPrimitives(dptPrimitiveType, Replay.vertexCount),
 						Replay.vertices.data(),
 						Replay.stride);
+
+					if (replayBackBufferApplied && replayPreviousRt)
+					{
+						(*d3d9Device)->SetRenderTarget(0, replayPreviousRt);
+					}
+
+					if (replayDebugStateApplied)
+					{
+						(*d3d9Device)->SetRenderState(D3DRS_ZENABLE, replayOldZEnable);
+						(*d3d9Device)->SetRenderState(D3DRS_ZWRITEENABLE, replayOldZWriteEnable);
+						(*d3d9Device)->SetRenderState(D3DRS_ALPHABLENDENABLE, replayOldAlphaBlendEnable);
+						(*d3d9Device)->SetRenderState(D3DRS_CULLMODE, replayOldCullMode);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_COLOROP, replayOldColorOp);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_COLORARG1, replayOldColorArg1);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_COLORARG2, replayOldColorArg2);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAOP, replayOldAlphaOp);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG1, replayOldAlphaArg1);
+						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG2, replayOldAlphaArg2);
+						(*d3d9Device)->SetTexture(0, replayTexture0);
+					}
+				}
+
+				if (replayTexture0)
+				{
+					replayTexture0->Release();
+				}
+				if (replayBackBuffer)
+				{
+					replayBackBuffer->Release();
+				}
+				if (replayPreviousRt)
+				{
+					replayPreviousRt->Release();
 				}
 
 				LOG_LIMIT(200, "[DarkenedSkye-Dd7to9Diag] replay-draw"
@@ -3818,6 +3951,9 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 					" replayFVF=" << Logging::hex(Replay.fvf) <<
 					" vertices=" << Replay.vertexCount <<
 					" stride=" << Replay.stride <<
+					" replayTarget=" << (replayBackBufferApplied ? "backBuffer" : "currentRT") <<
+					" visibilityTest=" << (replayVisibilityTest ? 1 : 0) <<
+					" targetHr=" << (D3DERR)replayTargetHr <<
 					" hr=" << (D3DERR)replayHr);
 			}
 		}

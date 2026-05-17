@@ -27,6 +27,7 @@ namespace
 	constexpr DWORD kTlVertexCursorVa = 0x0054D150;
 	constexpr DWORD kSourceVertexCountVa = 0x004FDC74;
 	constexpr DWORD kSourceVertexBufferVa = 0x004FEDA0;
+	constexpr DWORD kScratchSegmentOffset = 0x2680;
 	constexpr DWORD kCameraXVa = 0x00506EC8;
 	constexpr DWORD kCameraYVa = 0x00506ECC;
 	constexpr DWORD kCameraZVa = 0x00506ED0;
@@ -467,6 +468,19 @@ namespace
 		{
 			CaptureSampleFromAddress(snapshot, i, 0xFFFFFFFF, snapshot->sourceCurrent + (i * snapshot->sourceStride));
 		}
+
+		// Some draws stage transformed vertices at currentSourceVertexPointer.
+		// If sourceCurrent is unreadable, fall back to that cursor so replay
+		// extraction stays aligned with the active draw stream.
+		if (!snapshot->samples[0].readable && snapshot->currentSourceVertexPointer)
+		{
+			snapshot->sourceBase = snapshot->currentSourceVertexPointer;
+			snapshot->sourceCurrent = snapshot->currentSourceVertexPointer;
+			for (DWORD i = 0; i < snapshot->sampleCount; ++i)
+			{
+				CaptureSampleFromAddress(snapshot, i, 0xFFFFFFFF, snapshot->sourceCurrent + (i * snapshot->sourceStride));
+			}
+		}
 	}
 
 	void CaptureIndexedSamples(TransformSnapshot* snapshot, DWORD vertexBase, DWORD indexBase)
@@ -532,11 +546,8 @@ namespace
 		switch (snapshot.kind)
 		{
 		case SourceKindScratchInPlace:
-			if (snapshot.regs.eax == 0)
-			{
-				CaptureScratchSamples(&snapshot);
-			}
-			else
+			CaptureScratchSamples(&snapshot);
+			if (snapshot.sampleCount == 0 || !snapshot.samples[0].readable)
 			{
 				return;
 			}
@@ -740,14 +751,116 @@ namespace
 		return count == maxVertices;
 	}
 
-	bool ReadScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
+	DWORD AppendReplayPositionsFromAddress(DWORD sourceCurrent, DWORD sourceStride, float* positionsXyz, DWORD startVertex, DWORD maxVertices)
+	{
+		if (!positionsXyz || !sourceCurrent || sourceStride < 12 || startVertex >= maxVertices)
+		{
+			return startVertex;
+		}
+
+		DWORD count = startVertex;
+		for (; count < maxVertices; ++count)
+		{
+			const DWORD vertexAddress = sourceCurrent + ((count - startVertex) * sourceStride);
+			if (!ReadReplayPosition(vertexAddress, &positionsXyz[count * 3]))
+			{
+				break;
+			}
+		}
+
+		return count;
+	}
+
+	bool ReadSegmentedScratchReplayPositions(const TransformSnapshot& transform, DWORD primarySource, DWORD sourceStride, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, bool* outUsedStitch)
+	{
+		if (outUsedStitch)
+		{
+			*outUsedStitch = false;
+		}
+
+		if (!positionsXyz || !outVertexCount || !primarySource || sourceStride < 12)
+		{
+			return false;
+		}
+
+		if (ReadReplayPositionsFromAddress(primarySource, sourceStride, positionsXyz, maxVertices, outVertexCount))
+		{
+			return true;
+		}
+
+		if (!*outVertexCount)
+		{
+			return false;
+		}
+
+		const DWORD scratchBase = VaToRuntime(kSourceVertexBufferVa);
+		const DWORD scratchSplit = scratchBase ? (scratchBase + kScratchSegmentOffset) : 0;
+
+		DWORD candidates[6] = {};
+		DWORD candidateCount = 0;
+		auto pushCandidate = [&](DWORD candidate)
+		{
+			if (!candidate || candidate == primarySource)
+			{
+				return;
+			}
+
+			for (DWORD i = 0; i < candidateCount; ++i)
+			{
+				if (candidates[i] == candidate)
+				{
+					return;
+				}
+			}
+
+			if (candidateCount < ARRAYSIZE(candidates))
+			{
+				candidates[candidateCount++] = candidate;
+			}
+		};
+
+		if (scratchBase && scratchSplit)
+		{
+			if (primarySource < scratchSplit)
+			{
+				pushCandidate(scratchSplit);
+				pushCandidate(scratchBase);
+			}
+			else
+			{
+				pushCandidate(scratchBase);
+				pushCandidate(scratchSplit);
+			}
+		}
+
+		pushCandidate(transform.sourceCurrent);
+		pushCandidate(transform.sourceVertexPointer);
+		pushCandidate(transform.currentSourceVertexPointer);
+
+		const DWORD baseCount = *outVertexCount;
+		DWORD stitchedCount = baseCount;
+		for (DWORD i = 0; i < candidateCount && stitchedCount < maxVertices; ++i)
+		{
+			stitchedCount = AppendReplayPositionsFromAddress(candidates[i], sourceStride, positionsXyz, stitchedCount, maxVertices);
+		}
+
+		if (outUsedStitch && stitchedCount > baseCount)
+		{
+			*outUsedStitch = true;
+		}
+
+		*outVertexCount = stitchedCount;
+		return stitchedCount == maxVertices;
+	}
+
+	bool ReadScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, bool* outUsedStitch)
 	{
 		if (transform.kind != SourceKindScratchInPlace)
 		{
 			return false;
 		}
 
-		return ReadReplayPositionsFromAddress(transform.sourceCurrent, transform.sourceStride, positionsXyz, maxVertices, outVertexCount);
+		return ReadSegmentedScratchReplayPositions(transform, transform.sourceCurrent, transform.sourceStride, positionsXyz, maxVertices, outVertexCount, outUsedStitch);
 	}
 
 	bool ReadIndexedScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
@@ -761,7 +874,8 @@ namespace
 			return false;
 		}
 
-		if (!ReadReplayPositionsFromAddress(transform.sourceVertexPointer, 0x34, positionsXyz, maxVertices, outVertexCount))
+		bool usedStitch = false;
+		if (!ReadSegmentedScratchReplayPositions(transform, transform.sourceVertexPointer, 0x34, positionsXyz, maxVertices, outVertexCount, &usedStitch))
 		{
 			if (outReason)
 			{
@@ -838,7 +952,7 @@ namespace
 		return success;
 	}
 
-	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason, const char** outReplaySource)
+	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason, const char** outReplaySource, const char** outFallbackReason)
 	{
 		if (outVertexCount)
 		{
@@ -852,6 +966,10 @@ namespace
 		{
 			*outReplaySource = nullptr;
 		}
+		if (outFallbackReason)
+		{
+			*outFallbackReason = nullptr;
+		}
 
 		if (!HasNonZeroCamera(transform))
 		{
@@ -864,11 +982,12 @@ namespace
 
 		if (transform.kind == SourceKindScratchInPlace)
 		{
-			if (ReadScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount))
+			bool usedScratchStitch = false;
+			if (ReadScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &usedScratchStitch))
 			{
 				if (outReplaySource)
 				{
-					*outReplaySource = "scratch";
+					*outReplaySource = usedScratchStitch ? "scratchStitched" : "scratch";
 				}
 				return true;
 			}
@@ -883,6 +1002,7 @@ namespace
 		if (transform.kind == SourceKindIndexedEdiEdx || transform.kind == SourceKindIndexedEbpEsi)
 		{
 			const char* indexedReason = nullptr;
+			const char* indexedScratchReason = nullptr;
 			if (ReadIndexedReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &indexedReason))
 			{
 				if (outReplaySource)
@@ -892,7 +1012,7 @@ namespace
 				return true;
 			}
 
-			if (ReadIndexedScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, outReason))
+			if (ReadIndexedScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &indexedScratchReason))
 			{
 				if (outReplaySource)
 				{
@@ -901,9 +1021,13 @@ namespace
 				return true;
 			}
 
-			if (outReason && indexedReason)
+			if (outReason)
 			{
-				*outReason = indexedReason;
+				*outReason = indexedReason ? indexedReason : "indexed-source-unavailable";
+			}
+			if (outFallbackReason)
+			{
+				*outFallbackReason = indexedScratchReason;
 			}
 			return false;
 		}
@@ -913,6 +1037,26 @@ namespace
 			*outReason = "unsupported-kind";
 		}
 		return false;
+	}
+
+	DWORD AlignReplayVertexCountForPrimitive(DWORD primitiveType, DWORD vertexCount)
+	{
+		switch (primitiveType)
+		{
+		case 1: // D3DPT_POINTLIST
+			return vertexCount;
+		case 2: // D3DPT_LINELIST
+			return (vertexCount / 2) * 2;
+		case 3: // D3DPT_LINESTRIP
+			return vertexCount >= 2 ? vertexCount : 0;
+		case 4: // D3DPT_TRIANGLELIST
+			return (vertexCount / 3) * 3;
+		case 5: // D3DPT_TRIANGLESTRIP
+		case 6: // D3DPT_TRIANGLEFAN
+			return vertexCount >= 3 ? vertexCount : 0;
+		default:
+			return vertexCount;
+		}
 	}
 }
 
@@ -991,12 +1135,59 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	const TransformSnapshot& transform = preSubmit.transform;
 	const char* replaySkipReason = nullptr;
 	const char* replaySource = nullptr;
-	if (!ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason, &replaySource))
+	const char* replayFallbackSkipReason = nullptr;
+	if (!ReadReplayPositions(transform, PositionsXyz, VertexCount, OutVertexCount, &replaySkipReason, &replaySource, &replayFallbackSkipReason))
 	{
+		bool allowPartialReplay = false;
+		if (replaySkipReason && std::strcmp(replaySkipReason, "position-read-failed") == 0 && *OutVertexCount)
+		{
+			const DWORD alignedVertexCount = AlignReplayVertexCountForPrimitive(PrimitiveType, *OutVertexCount);
+			const bool hasMinimumGeometry = alignedVertexCount >= 96;
+			const bool hasUsefulCoverage = (alignedVertexCount * 100) >= (VertexCount * 15);
+			if (alignedVertexCount && alignedVertexCount < VertexCount && hasMinimumGeometry && hasUsefulCoverage)
+			{
+				allowPartialReplay = true;
+				*OutVertexCount = alignedVertexCount;
+				replaySource = "partial";
+
+				LOG_LIMIT(400, "[DarkenedSkye-Bridge] replay-partial"
+					" reason=" << replaySkipReason <<
+					" fallbackReason=" << (replayFallbackSkipReason ? replayFallbackSkipReason : "none") <<
+					" primitive=" << PrimitiveType <<
+					" fvf=" << Logging::hex(FVF) <<
+					" requestedVertices=" << VertexCount <<
+					" replayVertices=" << *OutVertexCount <<
+					" kind=" << KindName(transform.kind) <<
+					" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
+					" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+					" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
+					" sourceStride=" << transform.sourceStride <<
+					" indexStride=" << transform.indexStride);
+			}
+		}
+
+		if (allowPartialReplay)
+		{
+			LOG_LIMIT(1000, "[DarkenedSkye-Bridge] replay-positions"
+				" primitive=" << PrimitiveType <<
+				" fvf=" << Logging::hex(FVF) <<
+				" vertices=" << VertexCount <<
+				" kind=" << KindName(transform.kind) <<
+				" replaySource=" << (replaySource ? replaySource : "unknown") <<
+				" sourceBase=" << FormatSkyeAddress(transform.sourceBase) <<
+				" sourceCurrent=" << FormatSkyeAddress(transform.sourceCurrent) <<
+				" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
+				" sourceStride=" << transform.sourceStride <<
+				" indexStride=" << transform.indexStride <<
+				" readVertices=" << *OutVertexCount);
+			return true;
+		}
+
 		if (replaySkipReason && std::strcmp(replaySkipReason, "zero-camera") == 0)
 		{
 			LOG_LIMIT(80, "[DarkenedSkye-Bridge] replay-skip"
 				" reason=" << replaySkipReason <<
+				" fallbackReason=" << (replayFallbackSkipReason ? replayFallbackSkipReason : "none") <<
 				" primitive=" << PrimitiveType <<
 				" fvf=" << Logging::hex(FVF) <<
 				" vertices=" << VertexCount <<
@@ -1012,6 +1203,7 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 		{
 			LOG_LIMIT(1000, "[DarkenedSkye-Bridge] replay-skip"
 				" reason=" << (replaySkipReason ? replaySkipReason : "source-unavailable") <<
+				" fallbackReason=" << (replayFallbackSkipReason ? replayFallbackSkipReason : "none") <<
 				" primitive=" << PrimitiveType <<
 				" fvf=" << Logging::hex(FVF) <<
 				" vertices=" << VertexCount <<

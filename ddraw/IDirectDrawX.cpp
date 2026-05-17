@@ -5729,6 +5729,29 @@ HRESULT m_IDirectDrawX::Present(RECT* pSourceRect, RECT* pDestRect)
 		}
 		else
 		{
+			if (Config.DdrawDarkenedSkyeBridge && Config.DdrawDarkenedSkyeReplayVisibilityTest)
+			{
+				IDirect3DSurface9* presentBackBuffer = nullptr;
+				HRESULT overlayHr = d3d9Device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &presentBackBuffer);
+				if (SUCCEEDED(overlayHr) && presentBackBuffer)
+				{
+					RECT overlayRect = { 0, 0, static_cast<LONG>(presParams.BackBufferWidth), static_cast<LONG>(presParams.BackBufferHeight) };
+					overlayRect.right = (overlayRect.right > 96) ? 96 : overlayRect.right;
+					overlayRect.bottom = (overlayRect.bottom > 96) ? 96 : overlayRect.bottom;
+
+					if (overlayRect.right > overlayRect.left && overlayRect.bottom > overlayRect.top)
+					{
+						overlayHr = d3d9Device->ColorFill(presentBackBuffer, &overlayRect, D3DCOLOR_ARGB(0xFF, 0xFF, 0x00, 0xFF));
+					}
+
+					presentBackBuffer->Release();
+				}
+
+				LOG_LIMIT(120, "[DarkenedSkye-Dd7to9Diag] present-visibility-overlay"
+					" rect=0,0," << ((presParams.BackBufferWidth > 96) ? 96 : presParams.BackBufferWidth) << "," << ((presParams.BackBufferHeight > 96) ? 96 : presParams.BackBufferHeight) <<
+					" hr=" << (D3DERR)overlayHr);
+			}
+
 			hr = d3d9Device->Present(pSourceRect, pDestRect, nullptr, nullptr);
 		}
 	}

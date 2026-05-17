@@ -61,6 +61,8 @@ inline std::ostream& operator<<(std::ostream& os, const DHEX& dhex) {
 	visit(DdrawFixByteAlignment) \
 	visit(DdrawIntroVideoFix) \
 	visit(DdrawDarkenedSkyeBridge) \
+	visit(DdrawDarkenedSkyeReplayToBackBuffer) \
+	visit(DdrawDarkenedSkyeReplayVisibilityTest) \
 	visit(DdrawEmulateSurface) \
 	visit(DdrawReadFromGDI) \
 	visit(DdrawWriteToGDI) \
@@ -271,6 +273,8 @@ struct CONFIG
 	bool DdrawEnableByteAlignment = false;		// Disables 32bit / 64bit byte alignment
 	bool DdrawIntroVideoFix = false;			// Enables some fixes that may help with showing intro videos
 	bool DdrawDarkenedSkyeBridge = false;		// Enables Darkened Skye-specific pre-TL diagnostics for RTX Remix bring-up
+	bool DdrawDarkenedSkyeReplayToBackBuffer = false;	// Replays Darkened Skye bridge geometry on backbuffer as a diagnostic path
+	bool DdrawDarkenedSkyeReplayVisibilityTest = false;	// Forces replay draw to bright untextured geometry for on-screen visibility testing
 	DWORD DdrawResolutionHack = 0;				// Removes the artificial resolution limit from Direct3D7 and below https://github.com/UCyborg/LegacyD3DResolutionHack
 	bool DdrawRemoveScanlines = false;			// Experimental feature to removing interlaced black lines in a single frame
 	bool DdrawRemoveInterlacing = false;		// Experimental feature to removing interlacing between frames
