@@ -118,6 +118,14 @@ namespace
 		float z = 0.0f;
 	};
 
+	struct ReplayGeometryStats
+	{
+		Vec3 min = {};
+		Vec3 max = {};
+		Vec3 center = {};
+		bool valid = false;
+	};
+
 	struct PreSubmitSnapshot
 	{
 		volatile LONG valid = 0;
@@ -256,6 +264,13 @@ namespace
 		return result;
 	}
 
+	DWORD FloatToBits(float value)
+	{
+		DWORD result = 0;
+		std::memcpy(&result, &value, sizeof(result));
+		return result;
+	}
+
 	bool IsUsableFloat(float value)
 	{
 		return std::isfinite(value) && std::fabs(value) < 1.0e20f;
@@ -367,6 +382,48 @@ namespace
 		return true;
 	}
 
+	bool TryBuildNativeBasisAndEye(const TransformSnapshot& snapshot, Vec3* right, Vec3* up, Vec3* forward, Vec3* eye)
+	{
+		if (!right || !up || !forward || !eye)
+		{
+			return false;
+		}
+
+		*right = { BitsToFloat(snapshot.matrix[0]), BitsToFloat(snapshot.matrix[1]), BitsToFloat(snapshot.matrix[2]) };
+		*up = { BitsToFloat(snapshot.matrix[3]), BitsToFloat(snapshot.matrix[4]), BitsToFloat(snapshot.matrix[5]) };
+		*forward = { BitsToFloat(snapshot.matrix[6]), BitsToFloat(snapshot.matrix[7]), BitsToFloat(snapshot.matrix[8]) };
+		*eye = { BitsToFloat(snapshot.camera[0]), BitsToFloat(snapshot.camera[1]), BitsToFloat(snapshot.camera[2]) };
+
+		if (!IsUsableVec3(*right) || !IsUsableVec3(*up) || !IsUsableVec3(*forward) || !IsUsableVec3(*eye) ||
+			!Normalize(*right) || !Normalize(*up) || !Normalize(*forward))
+		{
+			return false;
+		}
+
+		if (IsNearlyZero(eye->x) && IsNearlyZero(eye->y) && IsNearlyZero(eye->z))
+		{
+			return false;
+		}
+
+		return std::fabs(Dot(*right, *up)) <= 0.02f &&
+			std::fabs(Dot(*right, *forward)) <= 0.02f &&
+			std::fabs(Dot(*up, *forward)) <= 0.02f;
+	}
+
+	bool ViewToWorldPosition(const Vec3& right, const Vec3& up, const Vec3& forward, const Vec3& eye, const float view[3], float world[3])
+	{
+		if (!view || !world ||
+			!IsUsableFloat(view[0]) || !IsUsableFloat(view[1]) || !IsUsableFloat(view[2]))
+		{
+			return false;
+		}
+
+		world[0] = eye.x + (right.x * view[0]) + (up.x * view[1]) + (forward.x * view[2]);
+		world[1] = eye.y + (right.y * view[0]) + (up.y * view[1]) + (forward.y * view[2]);
+		world[2] = eye.z + (right.z * view[0]) + (up.z * view[1]) + (forward.z * view[2]);
+		return IsUsableFloat(world[0]) && IsUsableFloat(world[1]) && IsUsableFloat(world[2]);
+	}
+
 	bool IsIndexedKind(DWORD kind)
 	{
 		return kind == SourceKindIndexedEdiEdx ||
@@ -384,6 +441,7 @@ namespace
 		case 0x0042AF0C:
 		case 0x0042B445:
 		case 0x0044E5DC:
+		case 0x0044E689:
 		case 0x0044E6DA:
 			return kScratchBatchVertexCount;
 		default:
@@ -561,6 +619,13 @@ namespace
 	{
 		std::ostringstream os;
 		os << '(' << BitsToFloat(values[0]) << ',' << BitsToFloat(values[1]) << ',' << BitsToFloat(values[2]) << ')';
+		return os.str();
+	}
+
+	std::string FormatVec3(const Vec3& value)
+	{
+		std::ostringstream os;
+		os << '(' << value.x << ',' << value.y << ',' << value.z << ')';
 		return os.str();
 	}
 
@@ -1199,6 +1264,68 @@ namespace
 		}
 	}
 
+	void CaptureOutputScratchSamples(TransformSnapshot* snapshot)
+	{
+		if (!snapshot)
+		{
+			return;
+		}
+
+		const DWORD scratchBase = VaToRuntime(kSourceVertexBufferVa);
+		snapshot->sourceBase = scratchBase;
+		snapshot->sourceCurrent = scratchBase;
+		snapshot->indexBase = snapshot->regs.edx;
+		snapshot->sourceStride = 0x34;
+		snapshot->indexStride = 0;
+		snapshot->sourceVertexCount = kScratchBatchVertexCount;
+		snapshot->sampleCount = kScratchBatchVertexCount;
+
+		Vec3 right = {};
+		Vec3 up = {};
+		Vec3 forward = {};
+		Vec3 eye = {};
+		const bool canConvertViewToWorld = TryBuildNativeBasisAndEye(*snapshot, &right, &up, &forward, &eye);
+
+		for (DWORD i = 0; i < snapshot->sampleCount; ++i)
+		{
+			const DWORD vertexAddress = snapshot->sourceCurrent + (i * snapshot->sourceStride);
+			RawVertexSample& sample = snapshot->samples[i];
+			sample.sample = i;
+			sample.index = 0xFFFFFFFF;
+			sample.address = vertexAddress;
+
+			DWORD viewBits[3] = {};
+			if (!canConvertViewToWorld ||
+				!TryRead(vertexAddress, &viewBits[0]) ||
+				!TryRead(vertexAddress + 4, &viewBits[1]) ||
+				!TryRead(vertexAddress + 8, &viewBits[2]))
+			{
+				sample.readable = false;
+				continue;
+			}
+
+			const float view[3] = { BitsToFloat(viewBits[0]), BitsToFloat(viewBits[1]), BitsToFloat(viewBits[2]) };
+			float world[3] = {};
+			if (!ViewToWorldPosition(right, up, forward, eye, view, world))
+			{
+				sample.readable = false;
+				continue;
+			}
+
+			sample.x = FloatToBits(world[0]);
+			sample.y = FloatToBits(world[1]);
+			sample.z = FloatToBits(world[2]);
+			sample.readable = true;
+		}
+	}
+
+	bool ShouldAppendIndexedAtTransformSite(DWORD site)
+	{
+		// 44E689 runs before the clip/visibility helper. Append only if the
+		// matching pre-submit hook proves the helper accepted this triangle.
+		return site != 0x0044E689;
+	}
+
 	SourceKind KindForSite(DWORD site)
 	{
 		switch (site)
@@ -1209,7 +1336,7 @@ namespace
 		case 0x0042B445:
 		case 0x0042B66B:
 			return SourceKindIndexedEdiEdx;
-		case 0x0044E5DC:
+		case 0x0044E689:
 			return SourceKindIndexedEbpEdx;
 		case 0x0044E6DA:
 			return SourceKindIndexedEbpEsi;
@@ -1257,7 +1384,14 @@ namespace
 			CaptureIndexedSamples(&snapshot, snapshot.regs.ebp, snapshot.regs.esi, snapshot.batchVertexCount);
 			break;
 		case SourceKindIndexedEbpEdx:
-			CaptureIndexedSamples(&snapshot, snapshot.regs.ebp, snapshot.regs.edx, snapshot.batchVertexCount);
+			if (site == 0x0044E689)
+			{
+				CaptureOutputScratchSamples(&snapshot);
+			}
+			else
+			{
+				CaptureIndexedSamples(&snapshot, snapshot.regs.ebp, snapshot.regs.edx, snapshot.batchVertexCount);
+			}
 			break;
 		default:
 			return;
@@ -1277,7 +1411,10 @@ namespace
 		if (IsIndexedKind(snapshot.kind))
 		{
 			g_latestIndexedTransform = snapshot;
-			AppendIndexedReplayBatch(0, snapshot);
+			if (ShouldAppendIndexedAtTransformSite(site))
+			{
+				AppendIndexedReplayBatch(0, snapshot);
+			}
 		}
 	}
 
@@ -1990,6 +2127,44 @@ namespace
 		}
 	}
 
+	bool ComputeReplayGeometryStats(const float* positionsXyz, DWORD vertexCount, ReplayGeometryStats* outStats)
+	{
+		if (!positionsXyz || !vertexCount || !outStats)
+		{
+			return false;
+		}
+
+		ReplayGeometryStats stats = {};
+		stats.min = { positionsXyz[0], positionsXyz[1], positionsXyz[2] };
+		stats.max = stats.min;
+		Vec3 sum = {};
+
+		for (DWORD i = 0; i < vertexCount; ++i)
+		{
+			const float* xyz = &positionsXyz[i * 3];
+			if (!IsUsableFloat(xyz[0]) || !IsUsableFloat(xyz[1]) || !IsUsableFloat(xyz[2]))
+			{
+				return false;
+			}
+
+			if (xyz[0] < stats.min.x) stats.min.x = xyz[0];
+			if (xyz[1] < stats.min.y) stats.min.y = xyz[1];
+			if (xyz[2] < stats.min.z) stats.min.z = xyz[2];
+			if (xyz[0] > stats.max.x) stats.max.x = xyz[0];
+			if (xyz[1] > stats.max.y) stats.max.y = xyz[1];
+			if (xyz[2] > stats.max.z) stats.max.z = xyz[2];
+			sum.x += xyz[0];
+			sum.y += xyz[1];
+			sum.z += xyz[2];
+		}
+
+		const float invCount = 1.0f / static_cast<float>(vertexCount);
+		stats.center = { sum.x * invCount, sum.y * invCount, sum.z * invCount };
+		stats.valid = true;
+		*outStats = stats;
+		return true;
+	}
+
 	bool ValidateReplayGeometry(DWORD primitiveType, const float* positionsXyz, DWORD vertexCount, const char** outReason, float* outMaxEdge)
 	{
 		if (outReason)
@@ -2333,6 +2508,19 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	const char* replayFallbackSkipReason = nullptr;
 	bool replayReadSucceeded = false;
 	if (transform.kind == SourceKindScratchInPlace &&
+		Config.DdrawDarkenedSkyeReplayDisableScratch)
+	{
+		replaySkipReason = "scratch-replay-disabled-by-config";
+		ResetScratchReplayAccumulator(preSubmit.threadId);
+	}
+	else if (transform.kind == SourceKindScratchInPlace &&
+		Config.DdrawDarkenedSkyeReplayMaxScratchVertices &&
+		VertexCount > Config.DdrawDarkenedSkyeReplayMaxScratchVertices)
+	{
+		replaySkipReason = "scratch-accum-over-max-vertices";
+		ResetScratchReplayAccumulator(preSubmit.threadId);
+	}
+	else if (transform.kind == SourceKindScratchInPlace &&
 		g_scratchReplay.valid &&
 		g_scratchReplay.threadId == preSubmit.threadId &&
 		(!preSubmit.site || !g_scratchReplay.lastPreSubmitSite || preSubmit.site == g_scratchReplay.lastPreSubmitSite))
@@ -2342,6 +2530,13 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 		{
 			replaySource = "scratchAccumulated";
 		}
+	}
+	else if (IsIndexedKind(transform.kind) &&
+		(Config.DdrawDarkenedSkyeReplayDisableIndexed ||
+			(Config.DdrawDarkenedSkyeReplayDisableIndexedEbpEdx && transform.kind == SourceKindIndexedEbpEdx)))
+	{
+		replaySkipReason = Config.DdrawDarkenedSkyeReplayDisableIndexed ? "indexed-replay-disabled-by-config" : "indexed-ebpedx-disabled-by-config";
+		ResetIndexedReplayAccumulator(preSubmit.threadId);
 	}
 	else if (transform.kind != SourceKindScratchInPlace)
 	{
@@ -2493,6 +2688,8 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 		return false;
 	}
 
+	ReplayGeometryStats replayStats = {};
+	ComputeReplayGeometryStats(PositionsXyz, *OutVertexCount, &replayStats);
 	LOG_LIMIT(1000, "[DarkenedSkye-Bridge] replay-positions"
 		" primitive=" << PrimitiveType <<
 		" fvf=" << Logging::hex(FVF) <<
@@ -2504,7 +2701,11 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 		" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
 		" sourceStride=" << transform.sourceStride <<
 		" indexStride=" << transform.indexStride <<
-		" readVertices=" << *OutVertexCount);
+		" readVertices=" << *OutVertexCount <<
+		" boundsMin=" << (replayStats.valid ? FormatVec3(replayStats.min) : "(invalid)") <<
+		" boundsMax=" << (replayStats.valid ? FormatVec3(replayStats.max) : "(invalid)") <<
+		" boundsCenter=" << (replayStats.valid ? FormatVec3(replayStats.center) : "(invalid)") <<
+		" maxEdge=" << maxReplayEdge);
 	return true;
 }
 
@@ -2514,6 +2715,7 @@ extern "C" void* g_SkyeBridgeTrampoline42AF0C = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B445 = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B66B = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline44E5DC = nullptr;
+extern "C" void* g_SkyeBridgeTrampoline44E689 = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline44E6DA = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42A395 = nullptr;
 extern "C" void* g_SkyeBridgeTrampoline42B042 = nullptr;
@@ -2568,6 +2770,7 @@ SKYE_TRANSFORM_HOOK(SkyeBridge_Hook42AF0C, 0042AF0Ch, g_SkyeBridgeTrampoline42AF
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook42B445, 0042B445h, g_SkyeBridgeTrampoline42B445)
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook42B66B, 0042B66Bh, g_SkyeBridgeTrampoline42B66B)
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook44E5DC, 0044E5DCh, g_SkyeBridgeTrampoline44E5DC)
+SKYE_TRANSFORM_HOOK(SkyeBridge_Hook44E689, 0044E689h, g_SkyeBridgeTrampoline44E689)
 SKYE_TRANSFORM_HOOK(SkyeBridge_Hook44E6DA, 0044E6DAh, g_SkyeBridgeTrampoline44E6DA)
 
 SKYE_PRESUBMIT_HOOK(SkyeBridge_Hook42A395, 0042A395h, g_SkyeBridgeTrampoline42A395)
@@ -2614,7 +2817,7 @@ void DarkenedSkyeBridge::MaybeInstall()
 	static const BYTE k42AF0C[] = { 0x8B, 0x0D, 0x0C, 0xAF, 0x52, 0x00 };
 	static const BYTE k42B445[] = { 0x33, 0xC0, 0x66, 0x8B, 0x02 };
 	static const BYTE k42B66B[] = { 0x33, 0xC0, 0x66, 0x8B, 0x02 };
-	static const BYTE k44E5DC[] = { 0x33, 0xC0, 0x83, 0xC1, 0x34, 0x66, 0x8B, 0x02 };
+	static const BYTE k44E689[] = { 0xC7, 0x05, 0x74, 0xDC, 0x4F, 0x00, 0x03, 0x00, 0x00, 0x00 };
 	static const BYTE k44E6DA[] = { 0x8B, 0xD6, 0xB9, 0xA8, 0xED, 0x4F, 0x00 };
 	static const BYTE kPreSubmit[] = { 0xFF, 0x15, 0xC4, 0xC9, 0x54, 0x00 };
 
@@ -2623,7 +2826,7 @@ void DarkenedSkyeBridge::MaybeInstall()
 	installed += InstallHook(0x0042AF0C, "SkyeTransform42AF0C", SkyeBridge_Hook42AF0C, &g_SkyeBridgeTrampoline42AF0C, k42AF0C, sizeof(k42AF0C)) ? 1 : 0;
 	installed += InstallHook(0x0042B445, "SkyeTransform42B445", SkyeBridge_Hook42B445, &g_SkyeBridgeTrampoline42B445, k42B445, sizeof(k42B445)) ? 1 : 0;
 	installed += InstallHook(0x0042B66B, "SkyeTransform42B66B", SkyeBridge_Hook42B66B, &g_SkyeBridgeTrampoline42B66B, k42B66B, sizeof(k42B66B)) ? 1 : 0;
-	installed += InstallHook(0x0044E5DC, "SkyeTransform44E5DC", SkyeBridge_Hook44E5DC, &g_SkyeBridgeTrampoline44E5DC, k44E5DC, sizeof(k44E5DC)) ? 1 : 0;
+	installed += InstallHook(0x0044E689, "SkyeTransform44E689", SkyeBridge_Hook44E689, &g_SkyeBridgeTrampoline44E689, k44E689, sizeof(k44E689)) ? 1 : 0;
 	installed += InstallHook(0x0044E6DA, "SkyeTransform44E6DA", SkyeBridge_Hook44E6DA, &g_SkyeBridgeTrampoline44E6DA, k44E6DA, sizeof(k44E6DA)) ? 1 : 0;
 
 	installed += InstallHook(0x0042A395, "SkyePreSubmit42A395", SkyeBridge_Hook42A395, &g_SkyeBridgeTrampoline42A395, kPreSubmit, sizeof(kPreSubmit)) ? 1 : 0;

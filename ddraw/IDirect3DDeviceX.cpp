@@ -3853,6 +3853,14 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 				DWORD replayOldAlphaOp = D3DTOP_SELECTARG1;
 				DWORD replayOldAlphaArg1 = D3DTA_TEXTURE;
 				DWORD replayOldAlphaArg2 = D3DTA_DIFFUSE;
+				bool replayHiddenStateApplied = false;
+				DWORD replayOldHiddenColorWriteEnable = 0xF;
+				DWORD replayOldHiddenZWriteEnable = TRUE;
+				bool replayNoopBlendStateApplied = false;
+				DWORD replayOldNoopBlendAlphaBlendEnable = FALSE;
+				DWORD replayOldNoopBlendSrcBlend = D3DBLEND_ONE;
+				DWORD replayOldNoopBlendDestBlend = D3DBLEND_ZERO;
+				DWORD replayOldNoopBlendZWriteEnable = TRUE;
 				if (SUCCEEDED(replayHr))
 				{
 					if (replayVisibilityTest)
@@ -3881,6 +3889,26 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
 						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
 						replayDebugStateApplied = true;
+					}
+					else if (Config.DdrawDarkenedSkyeReplayDisableColorWrite)
+					{
+						(*d3d9Device)->GetRenderState(D3DRS_COLORWRITEENABLE, &replayOldHiddenColorWriteEnable);
+						(*d3d9Device)->GetRenderState(D3DRS_ZWRITEENABLE, &replayOldHiddenZWriteEnable);
+						(*d3d9Device)->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+						(*d3d9Device)->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+						replayHiddenStateApplied = true;
+					}
+					else if (Config.DdrawDarkenedSkyeReplayNoopBlend)
+					{
+						(*d3d9Device)->GetRenderState(D3DRS_ALPHABLENDENABLE, &replayOldNoopBlendAlphaBlendEnable);
+						(*d3d9Device)->GetRenderState(D3DRS_SRCBLEND, &replayOldNoopBlendSrcBlend);
+						(*d3d9Device)->GetRenderState(D3DRS_DESTBLEND, &replayOldNoopBlendDestBlend);
+						(*d3d9Device)->GetRenderState(D3DRS_ZWRITEENABLE, &replayOldNoopBlendZWriteEnable);
+						(*d3d9Device)->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+						(*d3d9Device)->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
+						(*d3d9Device)->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+						(*d3d9Device)->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+						replayNoopBlendStateApplied = true;
 					}
 
 					if (Config.DdrawDarkenedSkyeReplayToBackBuffer)
@@ -3927,8 +3955,20 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 						(*d3d9Device)->SetTextureStageState(0, D3DTSS_COLORARG2, replayOldColorArg2);
 						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAOP, replayOldAlphaOp);
 						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG1, replayOldAlphaArg1);
-						(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG2, replayOldAlphaArg2);
-						(*d3d9Device)->SetTexture(0, replayTexture0);
+							(*d3d9Device)->SetTextureStageState(0, D3DTSS_ALPHAARG2, replayOldAlphaArg2);
+							(*d3d9Device)->SetTexture(0, replayTexture0);
+					}
+					if (replayHiddenStateApplied)
+					{
+						(*d3d9Device)->SetRenderState(D3DRS_COLORWRITEENABLE, replayOldHiddenColorWriteEnable);
+						(*d3d9Device)->SetRenderState(D3DRS_ZWRITEENABLE, replayOldHiddenZWriteEnable);
+					}
+					if (replayNoopBlendStateApplied)
+					{
+						(*d3d9Device)->SetRenderState(D3DRS_ALPHABLENDENABLE, replayOldNoopBlendAlphaBlendEnable);
+						(*d3d9Device)->SetRenderState(D3DRS_SRCBLEND, replayOldNoopBlendSrcBlend);
+						(*d3d9Device)->SetRenderState(D3DRS_DESTBLEND, replayOldNoopBlendDestBlend);
+						(*d3d9Device)->SetRenderState(D3DRS_ZWRITEENABLE, replayOldNoopBlendZWriteEnable);
 					}
 				}
 
@@ -3953,6 +3993,8 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 					" stride=" << Replay.stride <<
 					" replayTarget=" << (replayBackBufferApplied ? "backBuffer" : "currentRT") <<
 					" visibilityTest=" << (replayVisibilityTest ? 1 : 0) <<
+					" colorWriteDisabled=" << (replayHiddenStateApplied ? 1 : 0) <<
+					" noopBlend=" << (replayNoopBlendStateApplied ? 1 : 0) <<
 					" targetHr=" << (D3DERR)replayTargetHr <<
 					" hr=" << (D3DERR)replayHr);
 			}

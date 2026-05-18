@@ -63,6 +63,12 @@ inline std::ostream& operator<<(std::ostream& os, const DHEX& dhex) {
 	visit(DdrawDarkenedSkyeBridge) \
 	visit(DdrawDarkenedSkyeReplayToBackBuffer) \
 	visit(DdrawDarkenedSkyeReplayVisibilityTest) \
+	visit(DdrawDarkenedSkyeReplayDisableColorWrite) \
+	visit(DdrawDarkenedSkyeReplayNoopBlend) \
+	visit(DdrawDarkenedSkyeReplayDisableScratch) \
+	visit(DdrawDarkenedSkyeReplayDisableIndexed) \
+	visit(DdrawDarkenedSkyeReplayDisableIndexedEbpEdx) \
+	visit(DdrawDarkenedSkyeReplayMaxScratchVertices) \
 	visit(DdrawEmulateSurface) \
 	visit(DdrawReadFromGDI) \
 	visit(DdrawWriteToGDI) \
@@ -275,6 +281,12 @@ struct CONFIG
 	bool DdrawDarkenedSkyeBridge = false;		// Enables Darkened Skye-specific pre-TL diagnostics for RTX Remix bring-up
 	bool DdrawDarkenedSkyeReplayToBackBuffer = false;	// Replays Darkened Skye bridge geometry on backbuffer as a diagnostic path
 	bool DdrawDarkenedSkyeReplayVisibilityTest = false;	// Forces replay draw to bright untextured geometry for on-screen visibility testing
+	bool DdrawDarkenedSkyeReplayDisableColorWrite = false;	// Submits replay geometry without writing it into the visible color/depth buffers
+	bool DdrawDarkenedSkyeReplayNoopBlend = false;	// Submits replay geometry through a color-preserving blend state
+	bool DdrawDarkenedSkyeReplayDisableScratch = false;	// Disables Darkened Skye scratch-family replay for isolation
+	bool DdrawDarkenedSkyeReplayDisableIndexed = false;	// Disables all Darkened Skye indexed-family replay for isolation
+	bool DdrawDarkenedSkyeReplayDisableIndexedEbpEdx = false;	// Disables the 0x44E689 EBP/EDX output-scratch replay family
+	DWORD DdrawDarkenedSkyeReplayMaxScratchVertices = 0;	// Skips scratch replay draws above this vertex count, 0 disables the cap
 	DWORD DdrawResolutionHack = 0;				// Removes the artificial resolution limit from Direct3D7 and below https://github.com/UCyborg/LegacyD3DResolutionHack
 	bool DdrawRemoveScanlines = false;			// Experimental feature to removing interlaced black lines in a single frame
 	bool DdrawRemoveInterlacing = false;		// Experimental feature to removing interlacing between frames
