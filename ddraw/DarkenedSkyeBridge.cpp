@@ -44,6 +44,8 @@ namespace
 	constexpr DWORD kScratchBatchVertexCount = 3;
 	constexpr DWORD kMaxAccumulatedScratchReplayVertices = 4096;
 	constexpr float kMaxReplayTriangleEdgeLength = 4096.0f;
+	constexpr LONG kIndexedDiagSummaryInterval = 1024;
+	constexpr DWORD kMaxIndexedDiagBuckets = 24;
 
 	enum SourceKind : DWORD
 	{
@@ -130,11 +132,46 @@ namespace
 		volatile LONG valid = 0;
 		DWORD threadId = 0;
 		DWORD vertexCount = 0;
+		DWORD cursorBase = 0;
 		DWORD lastTransformSerial = 0;
 		DWORD lastPreSubmitSite = 0;
 		DWORD lastTick = 0;
 		TransformSnapshot latestTransform = {};
 		float positions[kMaxAccumulatedScratchReplayVertices * 3] = {};
+	};
+
+	enum IndexedDiagEventType : DWORD
+	{
+		IndexedDiagAppendAccepted = 0,
+		IndexedDiagAppendReject,
+		IndexedDiagAppendGap,
+		IndexedDiagAppendOverflow,
+		IndexedDiagAppendReset,
+		IndexedDiagConsumeOk,
+		IndexedDiagConsumeUnavailable,
+		IndexedDiagConsumeSiteMismatch,
+		IndexedDiagConsumeZeroCamera,
+		IndexedDiagConsumeCountMismatch,
+		IndexedDiagReplaySkip
+	};
+
+	struct IndexedDiagBucket
+	{
+		bool inUse = false;
+		DWORD preSubmitSite = 0;
+		DWORD transformSite = 0;
+		DWORD kind = SourceKindNone;
+		volatile LONG appendAccepted = 0;
+		volatile LONG appendReject = 0;
+		volatile LONG appendGap = 0;
+		volatile LONG appendOverflow = 0;
+		volatile LONG appendReset = 0;
+		volatile LONG consumeOk = 0;
+		volatile LONG consumeUnavailable = 0;
+		volatile LONG consumeSiteMismatch = 0;
+		volatile LONG consumeZeroCamera = 0;
+		volatile LONG consumeCountMismatch = 0;
+		volatile LONG replaySkip = 0;
 	};
 
 	LONG g_installState = 0;
@@ -144,10 +181,16 @@ namespace
 
 	TransformSnapshot g_latestTransform = {};
 	TransformSnapshot g_latestIndexedTransform = {};
+	TransformSnapshot g_latestScratchTransform = {};
+	TransformSnapshot g_latestIndexedEdiEdxTransform = {};
+	TransformSnapshot g_latestIndexedEbpEsiTransform = {};
+	TransformSnapshot g_latestIndexedEbpEdxTransform = {};
 	PreSubmitSnapshot g_latestPreSubmit = {};
 	PreSubmitSnapshot g_lastConsumedPreSubmit = {};
 	ReplayAccumulator g_scratchReplay = {};
 	ReplayAccumulator g_indexedReplay = {};
+	IndexedDiagBucket g_indexedDiagBuckets[kMaxIndexedDiagBuckets] = {};
+	volatile LONG g_indexedDiagEventSerial = 0;
 
 	DWORD VaToRuntime(DWORD va)
 	{
@@ -380,6 +423,95 @@ namespace
 		return true;
 	}
 
+	DWORD ExpectedKindForPreSubmitSite(DWORD site)
+	{
+		switch (site)
+		{
+		case 0x0042A395:
+		case 0x0042B042:
+			return SourceKindScratchInPlace;
+		case 0x0042B626:
+		case 0x0042B84C:
+			return SourceKindIndexedEdiEdx;
+		case 0x00439BFF:
+		case 0x0044E7E7:
+			return SourceKindIndexedEbpEsi;
+		case 0x0044E69C:
+			return SourceKindIndexedEbpEdx;
+		default:
+			return SourceKindNone;
+		}
+	}
+
+	TransformSnapshot* LatestTransformCacheForKindMutable(DWORD kind)
+	{
+		switch (kind)
+		{
+		case SourceKindScratchInPlace:
+			return &g_latestScratchTransform;
+		case SourceKindIndexedEdiEdx:
+			return &g_latestIndexedEdiEdxTransform;
+		case SourceKindIndexedEbpEsi:
+			return &g_latestIndexedEbpEsiTransform;
+		case SourceKindIndexedEbpEdx:
+			return &g_latestIndexedEbpEdxTransform;
+		default:
+			return nullptr;
+		}
+	}
+
+	const TransformSnapshot* LatestTransformCacheForKind(DWORD kind)
+	{
+		switch (kind)
+		{
+		case SourceKindScratchInPlace:
+			return &g_latestScratchTransform;
+		case SourceKindIndexedEdiEdx:
+			return &g_latestIndexedEdiEdxTransform;
+		case SourceKindIndexedEbpEsi:
+			return &g_latestIndexedEbpEsiTransform;
+		case SourceKindIndexedEbpEdx:
+			return &g_latestIndexedEbpEdxTransform;
+		default:
+			return nullptr;
+		}
+	}
+
+	bool TrySelectExpectedKindForPreSubmit(DWORD preSubmitSite, DWORD threadId, const TransformSnapshot& selected, TransformSnapshot* out)
+	{
+		if (!out)
+		{
+			return false;
+		}
+
+		const DWORD expectedKind = ExpectedKindForPreSubmitSite(preSubmitSite);
+		if (expectedKind == SourceKindNone || selected.kind == expectedKind)
+		{
+			return false;
+		}
+
+		const TransformSnapshot* candidate = LatestTransformCacheForKind(expectedKind);
+		if (!candidate || !candidate->valid || candidate->threadId != threadId)
+		{
+			return false;
+		}
+
+		if (selected.serial < candidate->serial || selected.tick < candidate->tick)
+		{
+			return false;
+		}
+
+		const DWORD serialDelta = selected.serial - candidate->serial;
+		const DWORD tickDelta = selected.tick - candidate->tick;
+		if (serialDelta > 64 || tickDelta > 8)
+		{
+			return false;
+		}
+
+		*out = *candidate;
+		return true;
+	}
+
 	const char* KindName(DWORD kind)
 	{
 		switch (kind)
@@ -454,11 +586,159 @@ namespace
 		return os.str();
 	}
 
+	IndexedDiagBucket* AcquireIndexedDiagBucket(DWORD preSubmitSite, DWORD transformSite, DWORD kind)
+	{
+		IndexedDiagBucket* freeBucket = nullptr;
+		for (DWORD i = 0; i < ARRAYSIZE(g_indexedDiagBuckets); ++i)
+		{
+			IndexedDiagBucket& bucket = g_indexedDiagBuckets[i];
+			if (!bucket.inUse)
+			{
+				if (!freeBucket)
+				{
+					freeBucket = &bucket;
+				}
+				continue;
+			}
+
+			if (bucket.preSubmitSite == preSubmitSite &&
+				bucket.transformSite == transformSite &&
+				bucket.kind == kind)
+			{
+				return &bucket;
+			}
+		}
+
+		if (!freeBucket)
+		{
+			return nullptr;
+		}
+
+		freeBucket->inUse = true;
+		freeBucket->preSubmitSite = preSubmitSite;
+		freeBucket->transformSite = transformSite;
+		freeBucket->kind = kind;
+		return freeBucket;
+	}
+
+	void LogIndexedDiagSummary(const char* trigger, LONG eventSerial)
+	{
+		for (DWORD i = 0; i < ARRAYSIZE(g_indexedDiagBuckets); ++i)
+		{
+			const IndexedDiagBucket& bucket = g_indexedDiagBuckets[i];
+			if (!bucket.inUse)
+			{
+				continue;
+			}
+
+			const LONG failures =
+				bucket.appendReject +
+				bucket.appendGap +
+				bucket.appendOverflow +
+				bucket.appendReset +
+				bucket.consumeUnavailable +
+				bucket.consumeSiteMismatch +
+				bucket.consumeZeroCamera +
+				bucket.consumeCountMismatch +
+				bucket.replaySkip;
+			if (!failures && !bucket.appendAccepted && !bucket.consumeOk)
+			{
+				continue;
+			}
+
+			LOG_LIMIT(300, "[DarkenedSkye-Bridge] indexed-diag-summary"
+				" trigger=" << trigger <<
+				" eventSerial=" << eventSerial <<
+				" preSubmit=" << FormatSkyeAddress(VaToRuntime(bucket.preSubmitSite)) <<
+				" transform=" << FormatSkyeAddress(VaToRuntime(bucket.transformSite)) <<
+				" kind=" << KindName(bucket.kind) <<
+				" appendAccepted=" << bucket.appendAccepted <<
+				" appendReject=" << bucket.appendReject <<
+				" appendGap=" << bucket.appendGap <<
+				" appendOverflow=" << bucket.appendOverflow <<
+				" appendReset=" << bucket.appendReset <<
+				" consumeOk=" << bucket.consumeOk <<
+				" consumeUnavailable=" << bucket.consumeUnavailable <<
+				" consumeSiteMismatch=" << bucket.consumeSiteMismatch <<
+				" consumeZeroCamera=" << bucket.consumeZeroCamera <<
+				" consumeCountMismatch=" << bucket.consumeCountMismatch <<
+				" replaySkip=" << bucket.replaySkip);
+		}
+	}
+
+	void NoteIndexedDiagEvent(IndexedDiagEventType eventType, DWORD preSubmitSite, DWORD transformSite, DWORD kind)
+	{
+		if (!IsIndexedKind(kind))
+		{
+			return;
+		}
+
+		IndexedDiagBucket* bucket = AcquireIndexedDiagBucket(preSubmitSite, transformSite, kind);
+		if (!bucket)
+		{
+			return;
+		}
+
+		volatile LONG* counter = nullptr;
+		switch (eventType)
+		{
+		case IndexedDiagAppendAccepted:
+			counter = &bucket->appendAccepted;
+			break;
+		case IndexedDiagAppendReject:
+			counter = &bucket->appendReject;
+			break;
+		case IndexedDiagAppendGap:
+			counter = &bucket->appendGap;
+			break;
+		case IndexedDiagAppendOverflow:
+			counter = &bucket->appendOverflow;
+			break;
+		case IndexedDiagAppendReset:
+			counter = &bucket->appendReset;
+			break;
+		case IndexedDiagConsumeOk:
+			counter = &bucket->consumeOk;
+			break;
+		case IndexedDiagConsumeUnavailable:
+			counter = &bucket->consumeUnavailable;
+			break;
+		case IndexedDiagConsumeSiteMismatch:
+			counter = &bucket->consumeSiteMismatch;
+			break;
+		case IndexedDiagConsumeZeroCamera:
+			counter = &bucket->consumeZeroCamera;
+			break;
+		case IndexedDiagConsumeCountMismatch:
+			counter = &bucket->consumeCountMismatch;
+			break;
+		case IndexedDiagReplaySkip:
+			counter = &bucket->replaySkip;
+			break;
+		default:
+			break;
+		}
+
+		if (!counter)
+		{
+			return;
+		}
+
+		InterlockedIncrement(counter);
+		const LONG eventSerial = InterlockedIncrement(&g_indexedDiagEventSerial);
+		if (eventSerial % kIndexedDiagSummaryInterval == 0)
+		{
+			// Periodic rollups keep family trends visible when per-event logs hit caps.
+			LogIndexedDiagSummary("periodic", eventSerial);
+		}
+	}
+
 	void ResetScratchReplayAccumulator(DWORD threadId)
 	{
 		g_scratchReplay.valid = 0;
 		g_scratchReplay.threadId = threadId;
 		g_scratchReplay.vertexCount = 0;
+		g_scratchReplay.cursorBase = 0;
 		g_scratchReplay.lastTransformSerial = 0;
 		g_scratchReplay.lastPreSubmitSite = 0;
 		g_scratchReplay.lastTick = 0;
@@ -470,6 +750,7 @@ namespace
 		g_indexedReplay.valid = 0;
 		g_indexedReplay.threadId = threadId;
 		g_indexedReplay.vertexCount = 0;
+		g_indexedReplay.cursorBase = 0;
 		g_indexedReplay.lastTransformSerial = 0;
 		g_indexedReplay.lastPreSubmitSite = 0;
 		g_indexedReplay.lastTick = 0;
@@ -621,6 +902,7 @@ namespace
 				" indexBase=" << FormatSkyeAddress(transform.indexBase) <<
 				" serial=" << transform.serial <<
 				" samples=" << FormatSamples(transform));
+			NoteIndexedDiagEvent(IndexedDiagAppendReject, preSubmitSite, transform.site, transform.kind);
 			return;
 		}
 
@@ -635,6 +917,7 @@ namespace
 		}
 
 		const DWORD expectedCursor = transform.tlVertexCursor;
+		const DWORD batchVertexCount = transform.batchVertexCount ? transform.batchVertexCount : kScratchBatchVertexCount;
 		if (!g_indexedReplay.valid ||
 			g_indexedReplay.threadId != transform.threadId ||
 			g_indexedReplay.latestTransform.kind != transform.kind ||
@@ -643,31 +926,66 @@ namespace
 		{
 			ResetIndexedReplayAccumulator(transform.threadId);
 			g_indexedReplay.valid = 1;
+			NoteIndexedDiagEvent(IndexedDiagAppendReset, preSubmitSite, transform.site, transform.kind);
 		}
 
-		if (g_indexedReplay.vertexCount != expectedCursor)
+		DWORD expectedRelativeCursor = expectedCursor;
+		if (g_indexedReplay.cursorBase && expectedCursor >= g_indexedReplay.cursorBase)
+		{
+			expectedRelativeCursor = expectedCursor - g_indexedReplay.cursorBase;
+		}
+
+		if (g_indexedReplay.vertexCount && expectedRelativeCursor < g_indexedReplay.vertexCount)
+		{
+			ResetIndexedReplayAccumulator(transform.threadId);
+			g_indexedReplay.valid = 1;
+			expectedRelativeCursor = expectedCursor;
+			NoteIndexedDiagEvent(IndexedDiagAppendReset, preSubmitSite, transform.site, transform.kind);
+		}
+
+		bool cursorMatchesPreBatch = (g_indexedReplay.vertexCount == expectedRelativeCursor);
+		bool cursorMatchesPostBatch = false;
+		if (batchVertexCount && expectedRelativeCursor >= batchVertexCount)
+		{
+			cursorMatchesPostBatch = (g_indexedReplay.vertexCount == (expectedRelativeCursor - batchVertexCount));
+		}
+
+		if (!cursorMatchesPreBatch && !cursorMatchesPostBatch && g_indexedReplay.vertexCount == 0)
+		{
+			g_indexedReplay.cursorBase = expectedCursor;
+			expectedRelativeCursor = 0;
+			cursorMatchesPreBatch = true;
+		}
+		const char* cursorMode = cursorMatchesPreBatch ? "pre" : (cursorMatchesPostBatch ? "post" : "none");
+
+		if (!cursorMatchesPreBatch && !cursorMatchesPostBatch)
 		{
 			LOG_LIMIT(240, "[DarkenedSkye-Bridge] indexed-accum-gap"
 				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmitSite)) <<
 				" transform=" << FormatSkyeAddress(VaToRuntime(transform.site)) <<
 				" expectedCursor=" << expectedCursor <<
+				" expectedRelative=" << expectedRelativeCursor <<
 				" haveVertices=" << g_indexedReplay.vertexCount <<
 				" kind=" << KindName(transform.kind) <<
+				" batchVertices=" << batchVertexCount <<
+				" cursorBase=" << g_indexedReplay.cursorBase <<
+				" cursorMode=" << cursorMode <<
 				" serial=" << transform.serial);
 			g_indexedReplay.lastTransformSerial = transform.serial;
 			g_indexedReplay.lastPreSubmitSite = preSubmitSite;
 			g_indexedReplay.lastTick = transform.tick;
 			g_indexedReplay.latestTransform = transform;
+			NoteIndexedDiagEvent(IndexedDiagAppendGap, preSubmitSite, transform.site, transform.kind);
 			return;
 		}
 
-		const DWORD batchVertexCount = transform.batchVertexCount ? transform.batchVertexCount : kScratchBatchVertexCount;
 		if (g_indexedReplay.vertexCount + batchVertexCount > kMaxAccumulatedScratchReplayVertices)
 		{
 			LOG_LIMIT(40, "[DarkenedSkye-Bridge] indexed-accum-overflow"
 				" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmitSite)) <<
 				" haveVertices=" << g_indexedReplay.vertexCount <<
 				" capacity=" << kMaxAccumulatedScratchReplayVertices);
+			NoteIndexedDiagEvent(IndexedDiagAppendOverflow, preSubmitSite, transform.site, transform.kind);
 			ResetIndexedReplayAccumulator(transform.threadId);
 			return;
 		}
@@ -688,6 +1006,7 @@ namespace
 		g_indexedReplay.lastTick = transform.tick;
 		g_indexedReplay.latestTransform = transform;
 		g_indexedReplay.valid = 1;
+		NoteIndexedDiagEvent(IndexedDiagAppendAccepted, preSubmitSite, transform.site, transform.kind);
 	}
 
 	bool IsSkyeProcess()
@@ -920,6 +1239,10 @@ namespace
 		snapshot.serial = static_cast<DWORD>(InterlockedIncrement(&g_nextSerial));
 		snapshot.valid = 1;
 		g_latestTransform = snapshot;
+		if (TransformSnapshot* latestForKind = LatestTransformCacheForKindMutable(snapshot.kind))
+		{
+			*latestForKind = snapshot;
+		}
 		if (g_lastConsumedPreSubmit.valid && g_lastConsumedPreSubmit.threadId == snapshot.threadId)
 		{
 			g_lastConsumedPreSubmit.valid = 0;
@@ -961,9 +1284,22 @@ namespace
 					" tickDelta=" << (g_latestTransform.tick - snapshot.transform.tick));
 			}
 
+			const TransformSnapshot selectedTransform = snapshot.transform;
+			TransformSnapshot expectedKindTransform = {};
+			if (TrySelectExpectedKindForPreSubmit(site, snapshot.threadId, selectedTransform, &expectedKindTransform))
+			{
+				snapshot.transform = expectedKindTransform;
+				LOG_LIMIT(400, "[DarkenedSkye-Bridge] pre-submit-kind-correction"
+					" preSubmit=" << FormatSkyeAddress(VaToRuntime(site)) <<
+					" selected=" << KindName(selectedTransform.kind) <<
+					" replacement=" << KindName(snapshot.transform.kind) <<
+					" transform=" << FormatSkyeAddress(VaToRuntime(snapshot.transform.site)) <<
+					" serialDelta=" << (selectedTransform.serial - snapshot.transform.serial) <<
+					" tickDelta=" << (selectedTransform.tick - snapshot.transform.tick));
+			}
+
 			if (snapshot.transform.kind == SourceKindScratchInPlace)
 			{
-				ResetIndexedReplayAccumulator(snapshot.threadId);
 				AppendScratchReplayBatch(site, snapshot.transform);
 			}
 			else if (IsIndexedKind(snapshot.transform.kind))
@@ -1687,6 +2023,7 @@ namespace
 			{
 				*outReason = "indexed-accum-unavailable";
 			}
+			NoteIndexedDiagEvent(IndexedDiagConsumeUnavailable, preSubmit.site, preSubmit.transform.site, preSubmit.transform.kind);
 			return false;
 		}
 
@@ -1696,7 +2033,7 @@ namespace
 			{
 				*outReason = "indexed-accum-site-mismatch";
 			}
-			ResetIndexedReplayAccumulator(preSubmit.threadId);
+			NoteIndexedDiagEvent(IndexedDiagConsumeSiteMismatch, preSubmit.site, g_indexedReplay.latestTransform.site, g_indexedReplay.latestTransform.kind);
 			return false;
 		}
 
@@ -1706,6 +2043,7 @@ namespace
 			{
 				*outReason = "zero-camera";
 			}
+			NoteIndexedDiagEvent(IndexedDiagConsumeZeroCamera, preSubmit.site, g_indexedReplay.latestTransform.site, g_indexedReplay.latestTransform.kind);
 			ResetIndexedReplayAccumulator(preSubmit.threadId);
 			return false;
 		}
@@ -1724,7 +2062,7 @@ namespace
 				" lastPreSubmit=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.lastPreSubmitSite)) <<
 				" lastTransform=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.latestTransform.site)) <<
 				" kind=" << KindName(g_indexedReplay.latestTransform.kind));
-			ResetIndexedReplayAccumulator(preSubmit.threadId);
+			NoteIndexedDiagEvent(IndexedDiagConsumeCountMismatch, preSubmit.site, g_indexedReplay.latestTransform.site, g_indexedReplay.latestTransform.kind);
 			return false;
 		}
 
@@ -1737,6 +2075,7 @@ namespace
 			" kind=" << KindName(g_indexedReplay.latestTransform.kind) <<
 			" lastSerial=" << g_indexedReplay.lastTransformSerial <<
 			" lastTick=" << g_indexedReplay.lastTick);
+		NoteIndexedDiagEvent(IndexedDiagConsumeOk, preSubmit.site, g_indexedReplay.latestTransform.site, g_indexedReplay.latestTransform.kind);
 		ResetIndexedReplayAccumulator(preSubmit.threadId);
 		return true;
 	}
@@ -1946,6 +2285,10 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 				" indexStride=" << transform.indexStride <<
 				" readVertices=" << *OutVertexCount);
 		}
+		if (IsIndexedKind(transform.kind))
+		{
+			NoteIndexedDiagEvent(IndexedDiagReplaySkip, preSubmit.site, transform.site, transform.kind);
+		}
 		return false;
 	}
 
@@ -1968,6 +2311,10 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 			" indexStride=" << transform.indexStride <<
 			" readVertices=" << *OutVertexCount <<
 			" maxEdge=" << maxReplayEdge);
+		if (IsIndexedKind(transform.kind))
+		{
+			NoteIndexedDiagEvent(IndexedDiagReplaySkip, preSubmit.site, transform.site, transform.kind);
+		}
 		*OutVertexCount = 0;
 		return false;
 	}
