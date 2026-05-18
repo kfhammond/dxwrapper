@@ -41,6 +41,8 @@ namespace
 	constexpr bool kEnableRawIndexedReplay = false;
 	constexpr bool kEnableIndexedPartialReplay = false;
 	constexpr bool kEnableIndexedScratchFallback = false;
+	constexpr bool kEnableIndexedCursorBaseReplay = false;
+	constexpr bool kEnableIndexedOutputScratchReplay = false;
 	constexpr DWORD kScratchBatchVertexCount = 3;
 	constexpr DWORD kMaxAccumulatedScratchReplayVertices = 4096;
 	constexpr float kMaxReplayTriangleEdgeLength = 4096.0f;
@@ -125,6 +127,14 @@ namespace
 		DWORD tick = 0;
 		PushadFrame regs = {};
 		TransformSnapshot transform = {};
+		DWORD indexedReplayValidAtSubmit = 0;
+		DWORD indexedReplayVertexCountAtSubmit = 0;
+		DWORD indexedReplayCursorBaseAtSubmit = 0;
+		DWORD indexedReplayLastTransformSerialAtSubmit = 0;
+		DWORD indexedReplayLastPreSubmitSiteAtSubmit = 0;
+		DWORD indexedReplayLastTickAtSubmit = 0;
+		DWORD indexedReplayLatestTransformSiteAtSubmit = 0;
+		DWORD indexedReplayLatestTransformKindAtSubmit = SourceKindNone;
 	};
 
 	struct ReplayAccumulator
@@ -757,6 +767,23 @@ namespace
 		g_indexedReplay.latestTransform = {};
 	}
 
+	void CaptureIndexedReplayStateAtSubmit(PreSubmitSnapshot* snapshot)
+	{
+		if (!snapshot)
+		{
+			return;
+		}
+
+		snapshot->indexedReplayValidAtSubmit = g_indexedReplay.valid ? 1 : 0;
+		snapshot->indexedReplayVertexCountAtSubmit = g_indexedReplay.vertexCount;
+		snapshot->indexedReplayCursorBaseAtSubmit = g_indexedReplay.cursorBase;
+		snapshot->indexedReplayLastTransformSerialAtSubmit = g_indexedReplay.lastTransformSerial;
+		snapshot->indexedReplayLastPreSubmitSiteAtSubmit = g_indexedReplay.lastPreSubmitSite;
+		snapshot->indexedReplayLastTickAtSubmit = g_indexedReplay.lastTick;
+		snapshot->indexedReplayLatestTransformSiteAtSubmit = g_indexedReplay.latestTransform.site;
+		snapshot->indexedReplayLatestTransformKindAtSubmit = g_indexedReplay.latestTransform.kind;
+	}
+
 	bool ScratchSamplesUsable(const TransformSnapshot& transform)
 	{
 		if (transform.kind != SourceKindScratchInPlace ||
@@ -1306,6 +1333,7 @@ namespace
 			{
 				ResetScratchReplayAccumulator(snapshot.threadId);
 				AppendIndexedReplayBatch(site, snapshot.transform);
+				CaptureIndexedReplayStateAtSubmit(&snapshot);
 			}
 			else
 			{
@@ -1648,12 +1676,58 @@ namespace
 		return true;
 	}
 
-	bool ReadIndexedReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	bool ReadIndexedOutputScratchReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	{
+		if (transform.kind != SourceKindIndexedEbpEdx)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-output-scratch-unsupported";
+			}
+			return false;
+		}
+
+		const DWORD scratchBase = VaToRuntime(kSourceVertexBufferVa);
+		if (!scratchBase)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-output-scratch-unavailable";
+			}
+			return false;
+		}
+
+		DWORD replayBase = scratchBase;
+		const DWORD batchVertexCount = transform.batchVertexCount ? transform.batchVertexCount : kScratchBatchVertexCount;
+		const DWORD cursorEnd = transform.tlVertexCursor + batchVertexCount;
+		if (transform.tlVertexCursor && maxVertices && cursorEnd >= maxVertices)
+		{
+			replayBase = scratchBase + ((cursorEnd - maxVertices) * 0x34);
+		}
+
+		bool usedStitch = false;
+		if (!ReadSegmentedScratchReplayPositions(transform, replayBase, 0x34, positionsXyz, maxVertices, outVertexCount, &usedStitch))
+		{
+			if (outReason)
+			{
+				*outReason = *outVertexCount ? "indexed-output-scratch-position-read-failed" : "indexed-output-scratch-unavailable";
+			}
+			return false;
+		}
+
+		if (outReason)
+		{
+			*outReason = nullptr;
+		}
+		return true;
+	}
+
+	bool ReadIndexedReplayPositionsFromIndexBase(const TransformSnapshot& transform, DWORD indexBase, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
 	{
 		if (!positionsXyz || !outVertexCount ||
 			!IsIndexedKind(transform.kind) ||
 			!transform.sourceBase ||
-			!transform.indexBase ||
+			!indexBase ||
 			transform.sourceStride < 12 ||
 			transform.indexStride != 2)
 		{
@@ -1668,7 +1742,7 @@ namespace
 		for (; count < maxVertices; ++count)
 		{
 			WORD index = 0;
-			const DWORD indexAddress = transform.indexBase + (count * transform.indexStride);
+			const DWORD indexAddress = indexBase + (count * transform.indexStride);
 			if (!TryRead(indexAddress, &index))
 			{
 				if (outReason)
@@ -1707,6 +1781,38 @@ namespace
 			*outReason = nullptr;
 		}
 		return success;
+	}
+
+	bool ReadIndexedReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	{
+		return ReadIndexedReplayPositionsFromIndexBase(transform, transform.indexBase, positionsXyz, maxVertices, outVertexCount, outReason);
+	}
+
+	bool ReadIndexedCursorBaseReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	{
+		if (!transform.tlVertexCursor ||
+			!transform.indexBase ||
+			transform.indexStride != 2)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-cursor-base-unavailable";
+			}
+			return false;
+		}
+
+		const DWORD cursorBytes = transform.tlVertexCursor * transform.indexStride;
+		if (transform.indexBase < cursorBytes)
+		{
+			if (outReason)
+			{
+				*outReason = "indexed-cursor-base-underflow";
+			}
+			return false;
+		}
+
+		const DWORD indexBase = transform.indexBase - cursorBytes;
+		return ReadIndexedReplayPositionsFromIndexBase(transform, indexBase, positionsXyz, maxVertices, outVertexCount, outReason);
 	}
 
 	bool ReadReplayPositions(const TransformSnapshot& transform, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason, const char** outReplaySource, const char** outFallbackReason)
@@ -1794,6 +1900,42 @@ namespace
 			else if (!kEnableRawIndexedReplay)
 			{
 				indexedReason = "indexed-raw-disabled";
+			}
+
+			if (kEnableIndexedOutputScratchReplay &&
+				transform.kind == SourceKindIndexedEbpEdx)
+			{
+				const char* outputScratchReason = nullptr;
+				if (ReadIndexedOutputScratchReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &outputScratchReason))
+				{
+					if (outReplaySource)
+					{
+						*outReplaySource = "indexedOutputScratch";
+					}
+					return true;
+				}
+				if (outputScratchReason)
+				{
+					indexedReason = outputScratchReason;
+				}
+			}
+
+			if (kEnableIndexedCursorBaseReplay &&
+				transform.kind == SourceKindIndexedEbpEdx)
+			{
+				const char* cursorBaseReason = nullptr;
+				if (ReadIndexedCursorBaseReplayPositions(transform, positionsXyz, maxVertices, outVertexCount, &cursorBaseReason))
+				{
+					if (outReplaySource)
+					{
+						*outReplaySource = "indexedCursorBase";
+					}
+					return true;
+				}
+				if (cursorBaseReason)
+				{
+					indexedReason = cursorBaseReason;
+				}
 			}
 
 			if (kEnableIndexedScratchFallback &&
@@ -2062,6 +2204,38 @@ namespace
 				" lastPreSubmit=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.lastPreSubmitSite)) <<
 				" lastTransform=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.latestTransform.site)) <<
 				" kind=" << KindName(g_indexedReplay.latestTransform.kind));
+			if (preSubmit.site == 0x0044E69C ||
+				preSubmit.transform.kind == SourceKindIndexedEbpEdx ||
+				g_indexedReplay.latestTransform.kind == SourceKindIndexedEbpEdx)
+			{
+				LOG_LIMIT(400, "[DarkenedSkye-Bridge] indexed-accum-mismatch-detail"
+					" preSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmit.site)) <<
+					" requestedVertices=" << vertexCount <<
+					" currentValid=" << g_indexedReplay.valid <<
+					" currentVertices=" << g_indexedReplay.vertexCount <<
+					" currentCursorBase=" << g_indexedReplay.cursorBase <<
+					" currentLastPreSubmit=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.lastPreSubmitSite)) <<
+					" currentLastTransform=" << FormatSkyeAddress(VaToRuntime(g_indexedReplay.latestTransform.site)) <<
+					" currentKind=" << KindName(g_indexedReplay.latestTransform.kind) <<
+					" currentLastSerial=" << g_indexedReplay.lastTransformSerial <<
+					" currentLastTick=" << g_indexedReplay.lastTick <<
+					" submitReplayValid=" << preSubmit.indexedReplayValidAtSubmit <<
+					" submitReplayVertices=" << preSubmit.indexedReplayVertexCountAtSubmit <<
+					" submitReplayCursorBase=" << preSubmit.indexedReplayCursorBaseAtSubmit <<
+					" submitReplayLastPreSubmit=" << FormatSkyeAddress(VaToRuntime(preSubmit.indexedReplayLastPreSubmitSiteAtSubmit)) <<
+					" submitReplayLastTransform=" << FormatSkyeAddress(VaToRuntime(preSubmit.indexedReplayLatestTransformSiteAtSubmit)) <<
+					" submitReplayKind=" << KindName(preSubmit.indexedReplayLatestTransformKindAtSubmit) <<
+					" submitReplayLastSerial=" << preSubmit.indexedReplayLastTransformSerialAtSubmit <<
+					" submitReplayLastTick=" << preSubmit.indexedReplayLastTickAtSubmit <<
+					" selectedTransform=" << FormatSkyeAddress(VaToRuntime(preSubmit.transform.site)) <<
+					" selectedKind=" << KindName(preSubmit.transform.kind) <<
+					" selectedSerial=" << preSubmit.transform.serial <<
+					" selectedCursor=" << preSubmit.transform.tlVertexCursor <<
+					" selectedSource=" << FormatSkyeAddress(preSubmit.transform.sourceBase) <<
+					" selectedIndex=" << FormatSkyeAddress(preSubmit.transform.indexBase) <<
+					" selectedSourceCount=" << preSubmit.transform.sourceVertexCount <<
+					" selectedBatch=" << preSubmit.transform.batchVertexCount);
+			}
 			NoteIndexedDiagEvent(IndexedDiagConsumeCountMismatch, preSubmit.site, g_indexedReplay.latestTransform.site, g_indexedReplay.latestTransform.kind);
 			return false;
 		}
