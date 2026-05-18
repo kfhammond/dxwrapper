@@ -11,6 +11,10 @@ namespace DarkenedSkyeBridge
 		DWORD kind = 0;
 		float camera[3] = {};
 		float view[16] = {};
+		float projectionScale = 0.0f;
+		float projectionCenterX = 0.0f;
+		float projectionCenterY = 0.0f;
+		float projectionNear = 0.0f;
 	};
 
 	void MaybeInstall();

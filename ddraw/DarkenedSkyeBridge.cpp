@@ -33,6 +33,10 @@ namespace
 	constexpr DWORD kCameraZVa = 0x00506ED0;
 	constexpr DWORD kMatrixBaseVa = 0x00506F14;
 	constexpr DWORD kMatrixFloatCount = 12;
+	constexpr DWORD kProjectionScaleVa = 0x004FFAE8;
+	constexpr DWORD kProjectionCenterXVa = 0x004FFB44;
+	constexpr DWORD kProjectionCenterYVa = 0x0052C94C;
+	constexpr DWORD kProjectionNearVa = 0x004FFB90;
 
 	constexpr DWORD kFvfPositionMask = 0x00E;
 	constexpr DWORD kFvfXyzRhw = 0x004;
@@ -94,6 +98,10 @@ namespace
 
 		DWORD camera[3] = {};
 		DWORD matrix[16] = {};
+		DWORD projectionScale = 0;
+		DWORD projectionCenterX = 0;
+		DWORD projectionCenterY = 0;
+		DWORD projectionNear = 0;
 		DWORD submitFunction = 0;
 		DWORD sourceVertexPointer = 0;
 		DWORD currentSourceVertexPointer = 0;
@@ -347,7 +355,7 @@ namespace
 			return false;
 		}
 
-		if (anyCamera)
+		if (!IsUsableVec3(translation) && anyCamera)
 		{
 			const Vec3 eye = { camera[0], camera[1], camera[2] };
 			if (!IsUsableVec3(eye))
@@ -1171,6 +1179,10 @@ namespace
 		TryRead(VaToRuntime(kCameraXVa), &snapshot->camera[0]);
 		TryRead(VaToRuntime(kCameraYVa), &snapshot->camera[1]);
 		TryRead(VaToRuntime(kCameraZVa), &snapshot->camera[2]);
+		TryRead(VaToRuntime(kProjectionScaleVa), &snapshot->projectionScale);
+		TryRead(VaToRuntime(kProjectionCenterXVa), &snapshot->projectionCenterX);
+		TryRead(VaToRuntime(kProjectionCenterYVa), &snapshot->projectionCenterY);
+		TryRead(VaToRuntime(kProjectionNearVa), &snapshot->projectionNear);
 		for (DWORD i = 0; i < kMatrixFloatCount; ++i)
 		{
 			TryRead(VaToRuntime(kMatrixBaseVa + (i * sizeof(DWORD))), &snapshot->matrix[i]);
@@ -1622,6 +1634,10 @@ namespace
 			" tlVB=" << FormatSkyeAddress(transform.sharedTlVertexBuffer) <<
 			" camera=" << FormatFloat3(transform.camera) <<
 			" matrix0_3=(" << BitsToFloat(transform.matrix[0]) << ',' << BitsToFloat(transform.matrix[1]) << ',' << BitsToFloat(transform.matrix[2]) << ',' << BitsToFloat(transform.matrix[3]) << ')' <<
+			" matrix9_11=(" << BitsToFloat(transform.matrix[9]) << ',' << BitsToFloat(transform.matrix[10]) << ',' << BitsToFloat(transform.matrix[11]) << ')' <<
+			" projection=(scale=" << BitsToFloat(transform.projectionScale) <<
+			",center=" << BitsToFloat(transform.projectionCenterX) << ',' << BitsToFloat(transform.projectionCenterY) <<
+			",near=" << BitsToFloat(transform.projectionNear) << ')' <<
 			" samples=" << FormatSamples(transform));
 	}
 
@@ -2472,6 +2488,18 @@ bool DarkenedSkyeBridge::GetLatestCameraState(CameraState* state)
 	}
 
 	if (!anyMatrix || !BuildViewFromNativeMatrix(nativeMatrix, result.camera, anyCamera, result.view))
+	{
+		return false;
+	}
+
+	result.projectionScale = BitsToFloat(snapshot.projectionScale);
+	result.projectionCenterX = BitsToFloat(snapshot.projectionCenterX);
+	result.projectionCenterY = BitsToFloat(snapshot.projectionCenterY);
+	result.projectionNear = BitsToFloat(snapshot.projectionNear);
+	if (!IsUsableFloat(result.projectionScale) ||
+		!IsUsableFloat(result.projectionCenterX) ||
+		!IsUsableFloat(result.projectionCenterY) ||
+		!IsUsableFloat(result.projectionNear))
 	{
 		return false;
 	}

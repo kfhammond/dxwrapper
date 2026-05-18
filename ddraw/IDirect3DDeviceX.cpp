@@ -197,8 +197,45 @@ namespace
 		return stream.str();
 	}
 
-	bool TryApplyDarkenedSkyeCameraView(IDirect3DDevice9* Device, DWORD FVF, D3DMATRIX& OldView)
+	bool BuildDarkenedSkyeProjectionMatrix(const DarkenedSkyeBridge::CameraState& State, const D3DVIEWPORT9& Viewport, D3DMATRIX& Projection)
 	{
+		if (!Viewport.Width || !Viewport.Height ||
+			!std::isfinite(State.projectionScale) ||
+			!std::isfinite(State.projectionCenterX) ||
+			!std::isfinite(State.projectionCenterY))
+		{
+			return false;
+		}
+
+		const float scale = State.projectionScale;
+		if (std::fabs(scale) < 1.0e-5f)
+		{
+			return false;
+		}
+
+		const float width = static_cast<float>(Viewport.Width);
+		const float height = static_cast<float>(Viewport.Height);
+		const float originX = static_cast<float>(Viewport.X);
+		const float originY = static_cast<float>(Viewport.Y);
+		const float nearPlane = (std::isfinite(State.projectionNear) && State.projectionNear > 0.001f) ? State.projectionNear : 1.0f;
+		const float farPlane = 1000000.0f;
+		const float zScale = farPlane / (farPlane - nearPlane);
+		const float zBias = (-nearPlane * farPlane) / (farPlane - nearPlane);
+
+		ZeroMemory(&Projection, sizeof(Projection));
+		Projection.m[0][0] = (2.0f * scale) / width;
+		Projection.m[1][1] = (-2.0f * scale) / height;
+		Projection.m[2][0] = (2.0f * (State.projectionCenterX - originX) / width) - 1.0f;
+		Projection.m[2][1] = 1.0f - (2.0f * (State.projectionCenterY - originY) / height);
+		Projection.m[2][2] = zScale;
+		Projection.m[2][3] = 1.0f;
+		Projection.m[3][2] = zBias;
+		return true;
+	}
+
+	bool TryApplyDarkenedSkyeCameraView(IDirect3DDevice9* Device, DWORD FVF, D3DMATRIX& OldView, D3DMATRIX& OldProjection, bool& ProjectionApplied)
+	{
+		ProjectionApplied = false;
 		if (!Config.DdrawDarkenedSkyeBridge ||
 			!Device ||
 			((FVF & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW))
@@ -219,7 +256,17 @@ namespace
 			dst[i] = state.view[i];
 		}
 
+		D3DVIEWPORT9 Viewport = {};
+		D3DMATRIX Projection = {};
+		const bool hasProjection =
+			SUCCEEDED(Device->GetViewport(&Viewport)) &&
+			BuildDarkenedSkyeProjectionMatrix(state, Viewport, Projection);
+
 		if (FAILED(Device->GetTransform(D3DTS_VIEW, &OldView)))
+		{
+			return false;
+		}
+		if (hasProjection && FAILED(Device->GetTransform(D3DTS_PROJECTION, &OldProjection)))
 		{
 			return false;
 		}
@@ -227,19 +274,43 @@ namespace
 		{
 			return false;
 		}
+		if (hasProjection)
+		{
+			if (FAILED(Device->SetTransform(D3DTS_PROJECTION, &Projection)))
+			{
+				Device->SetTransform(D3DTS_VIEW, &OldView);
+				return false;
+			}
+			ProjectionApplied = true;
+		}
 
 		LOG_LIMIT(160, "[DarkenedSkye-Dd7to9Diag] camera-stamp"
 			" serial=" << state.serial <<
 			" site=" << Logging::hex(state.site) <<
 			" kind=" << state.kind <<
 			" camera=(" << state.camera[0] << ',' << state.camera[1] << ',' << state.camera[2] << ')' <<
-			" view=" << View);
+			" projectionApplied=" << ProjectionApplied <<
+			" projectionScale=" << state.projectionScale <<
+			" projectionCenter=(" << state.projectionCenterX << ',' << state.projectionCenterY << ')' <<
+			" projectionNear=" << state.projectionNear <<
+			" viewport=(" << Viewport.X << ',' << Viewport.Y << ',' << Viewport.Width << ',' << Viewport.Height << ')' <<
+			" view=" << View <<
+			" projection=" << Projection);
 		return true;
 	}
 
-	void RestoreDarkenedSkyeCameraView(IDirect3DDevice9* Device, const D3DMATRIX& OldView, bool Applied)
+	void RestoreDarkenedSkyeCameraView(IDirect3DDevice9* Device, const D3DMATRIX& OldView, const D3DMATRIX& OldProjection, bool ViewApplied, bool ProjectionApplied)
 	{
-		if (Applied && Device)
+		if (!Device)
+		{
+			return;
+		}
+
+		if (ProjectionApplied)
+		{
+			Device->SetTransform(D3DTS_PROJECTION, &OldProjection);
+		}
+		if (ViewApplied)
 		{
 			Device->SetTransform(D3DTS_VIEW, &OldView);
 		}
@@ -3791,7 +3862,9 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 		SetDrawStates(FVF, dwFlags, DirectXVersion);
 
 		D3DMATRIX DarkenedSkyeOldView = {};
-		const bool DarkenedSkyeViewApplied = TryApplyDarkenedSkyeCameraView(*d3d9Device, FVF, DarkenedSkyeOldView);
+		D3DMATRIX DarkenedSkyeOldProjection = {};
+		bool DarkenedSkyeProjectionApplied = false;
+		const bool DarkenedSkyeViewApplied = TryApplyDarkenedSkyeCameraView(*d3d9Device, FVF, DarkenedSkyeOldView, DarkenedSkyeOldProjection, DarkenedSkyeProjectionApplied);
 		const bool darkenedSkyeSkipOriginalForReplay =
 			Config.DdrawDarkenedSkyeReplayVisibilityTest &&
 			DarkenedSkyeReplayVertexCount >= 96;
@@ -4000,7 +4073,7 @@ HRESULT m_IDirect3DDeviceX::DrawPrimitiveVB(D3DPRIMITIVETYPE dptPrimitiveType, L
 			}
 		}
 
-		RestoreDarkenedSkyeCameraView(*d3d9Device, DarkenedSkyeOldView, DarkenedSkyeViewApplied);
+		RestoreDarkenedSkyeCameraView(*d3d9Device, DarkenedSkyeOldView, DarkenedSkyeOldProjection, DarkenedSkyeViewApplied, DarkenedSkyeProjectionApplied);
 
 		// Handle dwFlags
 		RestoreDrawStates(hr, dwFlags, DirectXVersion);
@@ -4120,12 +4193,14 @@ HRESULT m_IDirect3DDeviceX::DrawIndexedPrimitiveVB(D3DPRIMITIVETYPE dptPrimitive
 		SetDrawStates(FVF, dwFlags, DirectXVersion);
 
 		D3DMATRIX DarkenedSkyeOldView = {};
-		const bool DarkenedSkyeViewApplied = TryApplyDarkenedSkyeCameraView(*d3d9Device, FVF, DarkenedSkyeOldView);
+		D3DMATRIX DarkenedSkyeOldProjection = {};
+		bool DarkenedSkyeProjectionApplied = false;
+		const bool DarkenedSkyeViewApplied = TryApplyDarkenedSkyeCameraView(*d3d9Device, FVF, DarkenedSkyeOldView, DarkenedSkyeOldProjection, DarkenedSkyeProjectionApplied);
 
 		// Draw primitive
 		HRESULT hr = (*d3d9Device)->DrawIndexedPrimitive(dptPrimitiveType, dwStartVertex, 0, dwNumVertices, 0, GetNumberOfPrimitives(dptPrimitiveType, dwIndexCount));
 
-		RestoreDarkenedSkyeCameraView(*d3d9Device, DarkenedSkyeOldView, DarkenedSkyeViewApplied);
+		RestoreDarkenedSkyeCameraView(*d3d9Device, DarkenedSkyeOldView, DarkenedSkyeOldProjection, DarkenedSkyeViewApplied, DarkenedSkyeProjectionApplied);
 
 		// Handle dwFlags
 		RestoreDrawStates(hr, dwFlags, DirectXVersion);
