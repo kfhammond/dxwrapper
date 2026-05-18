@@ -68,6 +68,7 @@ inline std::ostream& operator<<(std::ostream& os, const DHEX& dhex) {
 	visit(DdrawDarkenedSkyeReplayDisableScratch) \
 	visit(DdrawDarkenedSkyeReplayDisableIndexed) \
 	visit(DdrawDarkenedSkyeReplayDisableIndexedEbpEdx) \
+	visit(DdrawDarkenedSkyeReplayEnableTlUnproject) \
 	visit(DdrawDarkenedSkyeReplayMaxScratchVertices) \
 	visit(DdrawEmulateSurface) \
 	visit(DdrawReadFromGDI) \
@@ -286,6 +287,7 @@ struct CONFIG
 	bool DdrawDarkenedSkyeReplayDisableScratch = false;	// Disables Darkened Skye scratch-family replay for isolation
 	bool DdrawDarkenedSkyeReplayDisableIndexed = false;	// Disables all Darkened Skye indexed-family replay for isolation
 	bool DdrawDarkenedSkyeReplayDisableIndexedEbpEdx = false;	// Disables the 0x44E689 EBP/EDX output-scratch replay family
+	bool DdrawDarkenedSkyeReplayEnableTlUnproject = false;	// Reconstructs Skye world positions from submitted XYZRHW TL vertices
 	DWORD DdrawDarkenedSkyeReplayMaxScratchVertices = 0;	// Skips scratch replay draws above this vertex count, 0 disables the cap
 	DWORD DdrawResolutionHack = 0;				// Removes the artificial resolution limit from Direct3D7 and below https://github.com/UCyborg/LegacyD3DResolutionHack
 	bool DdrawRemoveScanlines = false;			// Experimental feature to removing interlaced black lines in a single frame

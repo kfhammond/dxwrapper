@@ -50,6 +50,10 @@ namespace
 	constexpr DWORD kScratchBatchVertexCount = 3;
 	constexpr DWORD kMaxAccumulatedScratchReplayVertices = 4096;
 	constexpr float kMaxReplayTriangleEdgeLength = 4096.0f;
+	constexpr DWORD kTlVertexStride = 32;
+	constexpr DWORD kTlVertexXOffset = 0;
+	constexpr DWORD kTlVertexYOffset = 4;
+	constexpr DWORD kTlVertexRhwOffset = 12;
 	constexpr LONG kIndexedDiagSummaryInterval = 1024;
 	constexpr DWORD kMaxIndexedDiagBuckets = 24;
 
@@ -430,6 +434,47 @@ namespace
 		world[1] = eye.y + (right.y * view[0]) + (up.y * view[1]) + (forward.y * view[2]);
 		world[2] = eye.z + (right.z * view[0]) + (up.z * view[1]) + (forward.z * view[2]);
 		return IsUsableFloat(world[0]) && IsUsableFloat(world[1]) && IsUsableFloat(world[2]);
+	}
+
+	bool TlScreenToWorldPosition(const TransformSnapshot& transform, float screenX, float screenY, float rhw, float world[3])
+	{
+		if (!world ||
+			!IsUsableFloat(screenX) ||
+			!IsUsableFloat(screenY) ||
+			!IsUsableFloat(rhw) ||
+			std::fabs(rhw) < 1.0e-8f)
+		{
+			return false;
+		}
+
+		const float scale = BitsToFloat(transform.projectionScale);
+		const float centerX = BitsToFloat(transform.projectionCenterX);
+		const float centerY = BitsToFloat(transform.projectionCenterY);
+		if (!IsUsableFloat(scale) ||
+			!IsUsableFloat(centerX) ||
+			!IsUsableFloat(centerY) ||
+			std::fabs(scale) < 1.0e-5f)
+		{
+			return false;
+		}
+
+		Vec3 right = {};
+		Vec3 up = {};
+		Vec3 forward = {};
+		Vec3 eye = {};
+		if (!TryBuildNativeBasisAndEye(transform, &right, &up, &forward, &eye))
+		{
+			return false;
+		}
+
+		const float viewZ = 1.0f / rhw;
+		const float view[3] =
+		{
+			(screenX - centerX) * viewZ / scale,
+			(screenY - centerY) * viewZ / scale,
+			viewZ
+		};
+		return ViewToWorldPosition(right, up, forward, eye, view, world);
 	}
 
 	bool IsIndexedKind(DWORD kind)
@@ -1689,6 +1734,83 @@ namespace
 		return true;
 	}
 
+	bool ReadTlUnprojectedReplayPositions(const TransformSnapshot& transform, DWORD startVertex, DWORD vertexCount, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount, const char** outReason)
+	{
+		if (outVertexCount)
+		{
+			*outVertexCount = 0;
+		}
+		if (outReason)
+		{
+			*outReason = nullptr;
+		}
+
+		if (!positionsXyz || !outVertexCount || !vertexCount || maxVertices < vertexCount)
+		{
+			if (outReason)
+			{
+				*outReason = "tl-unproject-invalid-args";
+			}
+			return false;
+		}
+
+		if (!transform.sharedTlVertexBuffer)
+		{
+			if (outReason)
+			{
+				*outReason = "tl-unproject-missing-vb";
+			}
+			return false;
+		}
+
+		if (!HasNonZeroCamera(transform))
+		{
+			if (outReason)
+			{
+				*outReason = "tl-unproject-zero-camera";
+			}
+			return false;
+		}
+
+		DWORD count = 0;
+		const DWORD baseAddress = transform.sharedTlVertexBuffer + (startVertex * kTlVertexStride);
+		for (; count < vertexCount; ++count)
+		{
+			const DWORD vertexAddress = baseAddress + (count * kTlVertexStride);
+			DWORD sxBits = 0;
+			DWORD syBits = 0;
+			DWORD rhwBits = 0;
+			if (!TryRead(vertexAddress + kTlVertexXOffset, &sxBits) ||
+				!TryRead(vertexAddress + kTlVertexYOffset, &syBits) ||
+				!TryRead(vertexAddress + kTlVertexRhwOffset, &rhwBits))
+			{
+				if (outReason)
+				{
+					*outReason = "tl-unproject-read-failed";
+				}
+				break;
+			}
+
+			float* xyz = &positionsXyz[count * 3];
+			if (!TlScreenToWorldPosition(transform, BitsToFloat(sxBits), BitsToFloat(syBits), BitsToFloat(rhwBits), xyz))
+			{
+				if (outReason)
+				{
+					*outReason = "tl-unproject-convert-failed";
+				}
+				break;
+			}
+		}
+
+		*outVertexCount = count;
+		const bool success = count == vertexCount;
+		if (success && outReason)
+		{
+			*outReason = nullptr;
+		}
+		return success;
+	}
+
 	bool ReadReplayPositionsFromAddress(DWORD sourceCurrent, DWORD sourceStride, float* positionsXyz, DWORD maxVertices, DWORD* outVertexCount)
 	{
 		if (!positionsXyz || !outVertexCount || !sourceCurrent || sourceStride < 12)
@@ -2591,6 +2713,24 @@ bool DarkenedSkyeBridge::CaptureDrawPrimitiveReplayPositions(DWORD PrimitiveType
 	else
 	{
 		replaySkipReason = "scratch-accum-unavailable";
+	}
+
+	if (!replayReadSucceeded && Config.DdrawDarkenedSkyeReplayEnableTlUnproject)
+	{
+		const char* tlUnprojectReason = nullptr;
+		DWORD tlUnprojectVertexCount = 0;
+		if (ReadTlUnprojectedReplayPositions(transform, StartVertex, VertexCount, PositionsXyz, MaxVertices, &tlUnprojectVertexCount, &tlUnprojectReason))
+		{
+			*OutVertexCount = tlUnprojectVertexCount;
+			replayReadSucceeded = true;
+			replaySource = "tlUnprojected";
+			replaySkipReason = nullptr;
+		}
+		else if (tlUnprojectReason && !replayFallbackSkipReason)
+		{
+			replayFallbackSkipReason = tlUnprojectReason;
+			*OutVertexCount = tlUnprojectVertexCount;
+		}
 	}
 
 	if (!replayReadSucceeded)
